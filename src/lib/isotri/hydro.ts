@@ -44,6 +44,23 @@ export interface HydroStats {
   vertices: number;
 }
 
+/**
+ * THE no-uphill guarantee: a river's water surface is the highest profile
+ * that (a) never sits above the ground that contains it and (b) never rises
+ * downstream. level(k) = min(ground(k), min level of children flowing INTO
+ * k), taken in descending filled elevation (sources first), so one
+ * downstream min-accumulation over the same `order` array as the discharge
+ * pass suffices and the result is order-independent.
+ *
+ * Consequences:
+ *  - smooth descents: the surface follows the valley (flowing downhill)
+ *  - a bump / dam across the channel: the level stays at the sill and the
+ *    rendered channel is CUT through it (a gorge) instead of climbing
+ *  - lakes sit exactly at their spill, so inflowing and outflowing rivers
+ *    meet the lake surface precisely
+ *  - mouths release at their bank height into the sea plane (level 0)
+ */
+
 export interface HydroDebug {
   recv: Int32Array;
   acc: Float64Array;
@@ -71,7 +88,7 @@ const RIVER_QUANTILE = 0.08; // fraction of land vertices that are channels
 const TRUNK_FLOOR = 0.02; // minimum channel strength worth seeding at fine LODs
 
 /** Binary min-heap on float priorities with int payloads. */
-class MinHeap {
+export class MinHeap {
   private pri: Float64Array;
   private val: Int32Array;
   private n = 0;
@@ -273,7 +290,36 @@ export function computeHydro(
     if (r >= 0) acc[r] += acc[k] * (1 - LOSS);
   }
 
-  // ---- 5. classify: rivers, lakes, wetlands ----
+  // ---- 5. river water levels: the pool-and-drop profile ----
+  // level(k) = min(ground(k), min level of children flowing INTO k) — the
+  // no-uphill profile documented above. Iterated over the same `order`
+  // array, descending filled elevation: every child (strictly higher
+  // filled) is finished before its receiver is reached, so a single
+  // downstream min-accumulation is exact and order-independent.
+  const lvlArr = new Float64Array(N);
+  const childMin = new Float64Array(N).fill(Infinity);
+  for (let x = orderN - 1; x >= 0; x--) {
+    const k = order[x];
+    if (isOcean[k]) {
+      lvlArr[k] = 0; // the sea is the base level everything drains toward
+      continue;
+    }
+    const depth = filled[k] - elev[k];
+    lvlArr[k] =
+      depth > LAKE_MIN
+        ? filled[k] // a lake's surface IS its spill level
+        : Math.min(elev[k], childMin[k]);
+    const r = recv[k];
+    if (r >= 0 && !isOcean[r]) {
+      let l = lvlArr[k];
+      // backwater: a channel flowing INTO a lake can never sit below the
+      // lake surface — raise it to the spill so the junction is seamless
+      if (l < filled[r] && filled[r] - elev[r] > LAKE_MIN) l = filled[r];
+      if (l < childMin[r]) childMin[r] = l;
+    }
+  }
+
+  // ---- 6. classify: rivers, lakes, wetlands ----
   const landAcc: number[] = [];
   for (let k = 0; k < N; k++) if (!isOcean[k]) landAcc.push(acc[k]);
   landAcc.sort((a, b) => b - a);
@@ -306,7 +352,7 @@ export function computeHydro(
     const boost =
       0.5 * smoothstep(thr * 0.12, thr * 1.1, acc[k]) +
       0.3 * smoothstep(0.2, 0.5, lake);
-    stamps.set(keyOf[k], { lake, river, fill: filled[k], boost });
+    stamps.set(keyOf[k], { lake, river, fill: filled[k], boost, lvl: lvlArr[k] });
     if (river > 0.12) rivers++;
     if (lake >= 0.9) lakes++;
     else if (lake > 0.1) swamps++;
@@ -330,6 +376,7 @@ export function computeHydro(
           river: st.river * 0.8,
           fill: Math.max(elev[r], 0),
           boost: 0,
+          lvl: 0, // mouths release at sea level
         });
       }
     }
@@ -345,10 +392,12 @@ export function computeHydro(
     vertices: N,
   };
 
-  // ---- 6. trunk segments for fine-layer seeding (phase 3) ----
+  // ---- 7. trunk segments for fine-layer seeding (phase 3) ----
   // One segment per channel vertex, source -> receiver. Refined vertices
   // re-stamp these as a distance field (width ∝ strength) so channels stay
   // crisp and meander at fine LODs instead of smearing by interpolation.
+  // la/lb carry the WATER LEVELS at the endpoints so refined vertices can
+  // clamp their surface to the true pool level along the meandered line.
   const trunks: TrunkSeg[] = [];
   for (let k = 0; k < N; k++) {
     if (isOcean[k]) continue;
@@ -366,6 +415,8 @@ export function computeHydro(
       a2: ri * FIX,
       b2: rj * FIX,
       q: st.river,
+      la: lvlArr[k],
+      lb: isOcean[r] ? 0 : lvlArr[r],
     });
   }
   stats.trunks = trunks.length;

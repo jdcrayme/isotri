@@ -32,6 +32,7 @@ import {
 import {
   ArrowDownToLine,
   Dices,
+  Eraser,
   Expand,
   Hand,
   Merge,
@@ -40,6 +41,7 @@ import {
   Paintbrush,
   Plus,
   RotateCcw,
+  Route,
   Split,
   Undo2,
   Redo2,
@@ -87,6 +89,12 @@ const TOOLS: { id: Tool; label: string; icon: React.ReactNode; hint: string }[] 
       hint: "Click a refined tile to merge its 4 children back. Blocked when a finer neighbour would be orphaned.",
     },
     {
+      id: "road",
+      label: "Road",
+      icon: <Route className="h-4 w-4" />,
+      hint: "Click a start point, then a destination — a road is routed over the terrain: it grades around slopes, fords rivers and bridges lakes, but never crosses the sea. Click again to start the next road; Esc cancels.",
+    },
+    {
       id: "pan",
       label: "Pan",
       icon: <Hand className="h-4 w-4" />,
@@ -100,12 +108,19 @@ export default function IsoTriEditor() {
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const resetArmed = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const showToast = (msg: string) => {
+    setToast(msg);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2600);
+  };
+
   const [tool, setTool] = useState<Tool>("paint");
   const [material, setMaterial] = useState(2);
   const [brush, setBrush] = useState(1.4);
   const [wireframe, setWireframe] = useState(false);
   const [dots, setDots] = useState(false);
   const [riversOn, setRiversOn] = useState(true);
+  const [roadsOn, setRoadsOn] = useState(true);
   const [fineDetail, setFineDetail] = useState(true);
   const [thrMult, setThrMult] = useState(1);
   const [seedText, setSeedText] = useState("7");
@@ -117,6 +132,7 @@ export default function IsoTriEditor() {
     lakes: 0,
     swamps: 0,
     trunks: 0,
+    roads: 0,
     hydroMs: 0,
     mapW: 30,
     mapH: 22,
@@ -136,11 +152,7 @@ export default function IsoTriEditor() {
       engine = new IsoTriEngine(hostRef.current, {
         onStats: setStats,
         onHover: setHover,
-        onToast: (m) => {
-          setToast(m);
-          if (toastTimer.current) clearTimeout(toastTimer.current);
-          toastTimer.current = setTimeout(() => setToast(null), 2400);
-        },
+        onToast: showToast,
       });
     } catch (e) {
       // defer so we don't setState synchronously inside the effect
@@ -181,6 +193,9 @@ export default function IsoTriEditor() {
   useEffect(() => {
     if (engineRef.current) engineRef.current.showRivers = riversOn;
   }, [riversOn]);
+  useEffect(() => {
+    if (engineRef.current) engineRef.current.showRoads = roadsOn;
+  }, [roadsOn]);
   useEffect(() => {
     engineRef.current?.setThrMult(thrMult);
   }, [thrMult]);
@@ -223,6 +238,26 @@ export default function IsoTriEditor() {
 
   const activeTool = TOOLS.find((t) => t.id === tool)!;
 
+  const doRefineAll = () => {
+    const n = engineRef.current?.subdivideAll() ?? 0;
+    if (n > 0)
+      showToast(
+        `Refined ${n.toLocaleString()} tiles one level — rivers re-stamp crisp on the finer mesh`
+      );
+  };
+
+  const doJoinAll = () => {
+    const n = engineRef.current?.coalesceAll() ?? 0;
+    if (n > 0)
+      showToast(`Joined ${n.toLocaleString()} blocks back to base tiles`);
+  };
+
+  const doClearRoads = () => {
+    const n = engineRef.current?.clearRoads() ?? 0;
+    if (n > 0)
+      showToast(`Removed ${n.toLocaleString()} road segments (undo brings them back)`);
+  };
+
   const fmtPct = (x: number) => Math.round(x * 100) + "%";
 
   return (
@@ -250,6 +285,11 @@ export default function IsoTriEditor() {
           <Badge variant="secondary" className="hidden font-mono text-[11px] sm:inline-flex">
             {stats.rivers} river · {stats.lakes} lake · {stats.swamps} wet
           </Badge>
+          {stats.roads > 0 && (
+            <Badge variant="secondary" className="hidden font-mono text-[11px] md:inline-flex">
+              {stats.roads} road
+            </Badge>
+          )}
           <Badge
             variant="outline"
             className="hidden font-mono text-[10px] text-zinc-500 lg:inline-flex"
@@ -442,6 +482,72 @@ export default function IsoTriEditor() {
 
           <section className="w-40 shrink-0 space-y-2 md:w-auto">
             <h2 className="text-[11px] font-medium uppercase tracking-wider text-zinc-500">
+              Mesh detail
+            </h2>
+            <div className="grid w-40 grid-cols-2 gap-1 md:w-auto">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-xs"
+                title="Subdivide every tile one level (whole-map cap L2)"
+                onClick={doRefineAll}
+              >
+                <Split className="mr-1 h-3.5 w-3.5" />
+                Refine all
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-xs"
+                title="Merge the whole mesh back to base tiles"
+                onClick={doJoinAll}
+              >
+                <Merge className="mr-1 h-3.5 w-3.5" />
+                Join all
+              </Button>
+            </div>
+            <p className="text-[10px] leading-snug text-zinc-500">
+              The fine hydrology detail lives on refined tiles: refine the
+              whole map to see crisp, meandering, branching rivers and flat
+              lake surfaces. Coarse views are the exact low-pass of fine
+              views, so nothing changes until you refine. Each click is one
+              undo step; the Subdivide tool still goes deeper per tile.
+            </p>
+          </section>
+
+          <section className="w-40 shrink-0 space-y-2 md:w-auto">
+            <h2 className="text-[11px] font-medium uppercase tracking-wider text-zinc-500">
+              Roads
+            </h2>
+            <div className="flex items-center justify-between gap-3">
+              <Label htmlFor="roads" className="text-xs text-zinc-300">
+                Show roads
+              </Label>
+              <Switch id="roads" checked={roadsOn} onCheckedChange={setRoadsOn} />
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <Label className="text-xs text-zinc-300">Network</Label>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-xs"
+                title="Remove every road (one undo step)"
+                onClick={doClearRoads}
+                disabled={stats.roads === 0}
+              >
+                <Eraser className="mr-1 h-3.5 w-3.5" />
+                Clear
+              </Button>
+            </div>
+            <p className="text-[10px] leading-snug text-zinc-500">
+              {stats.roads === 0
+                ? "Use the Road tool to route a path over the terrain — it grades around slopes, fords rivers and bridges lakes."
+                : `${stats.roads.toLocaleString()} segments authored. Roads persist in the save; they don't re-route when you sculpt (rivers do).`}
+            </p>
+          </section>
+
+          <section className="w-40 shrink-0 space-y-2 md:w-auto">
+            <h2 className="text-[11px] font-medium uppercase tracking-wider text-zinc-500">
               Hydrology
             </h2>
             <div className="flex items-center justify-between gap-3">
@@ -458,8 +564,10 @@ export default function IsoTriEditor() {
             </div>
             <p className="text-[10px] leading-snug text-zinc-500">
               seeds {stats.trunks.toLocaleString()} trunk segments into refined
-              tiles — rivers stay crisp and meander when you subdivide or zoom;
-              lake surfaces clamp flat to their water level.
+              tiles — click Refine all (above) to see the branching network.
+              Water is flat everywhere: the sea sits at sea level, lakes at
+              their spill, and rivers at a pool level that only ever drops
+              downstream — the channel is cut through hills, never climbs.
             </p>
             <div>
               <div className="mb-1 flex items-center justify-between">
@@ -519,14 +627,20 @@ export default function IsoTriEditor() {
             <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
               Vertices carry material weights; tiles blend them, so a beach
               appears wherever water and grass weights meet. Rain falls on the
-              continent, fills depressions into lakes (their spill level renders
-              as flat water), and discharge above a threshold carves rivers that
-              widen with flow. Everything is derived — sculpt the terrain and
-              the water re-routes. Refining tiles re-derives children as parent
-              interpolation + deterministic noise, and the coarse drainage
-              network is re-seeded onto refined tiles so rivers stay crisp and
-              pick up meander detail as you zoom. Your session auto-saves
-              locally.
+              continent, fills depressions into lakes, and discharge above a
+              threshold carves rivers that widen with flow. Water always
+              renders LEVEL: the sea is one plane at sea level, lakes sit at
+              their spill, and each river pool sits at a level computed as the
+              highest surface that never climbs — where the ground rises
+              across a channel it is cut into a gorge; dig the bed deeper and
+              the water stays. Everything is derived — sculpt the terrain and
+              the water re-routes. Roads are the authored exception: the Road
+              tool plans them over the current terrain (A\* across slopes,
+              rivers and lakes), then they stay put in the save. Refining
+              tiles re-derives children as parent interpolation + deterministic
+              noise, and the coarse drainage network is re-seeded onto refined
+              tiles so rivers stay crisp and pick up meander detail as you
+              zoom. Your session auto-saves locally.
             </p>
           </section>
         </aside>
@@ -601,8 +715,12 @@ export default function IsoTriEditor() {
                     const extras: string[] = [
                       `z ${c.z.toFixed(2)}`,
                     ];
+                    if (Math.abs(c.elev - c.z) > 0.005)
+                      extras.push(`bed ${c.elev.toFixed(2)}`);
                     if (c.river > 0.02) extras.push(`riv ${fmtPct(c.river)}`);
+                    if (c.road > 0.02) extras.push(`road ${fmtPct(c.road)}`);
                     if (c.lake > 0.02) extras.push(`lake ${fmtPct(c.lake)} · lvl ${c.fill.toFixed(2)}`);
+                    else if (c.river > 0.16) extras.push(`water lvl ${c.lvl.toFixed(2)}`);
                     return (
                       <div key={i} className="flex items-center gap-1.5">
                         <span

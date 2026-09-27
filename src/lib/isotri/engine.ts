@@ -35,10 +35,12 @@ import {
   sizeKeyFor,
   type MapGeometry,
   type Override,
+  type RoadSeg,
   type VV,
 } from "./field";
-import { TriMesh } from "./mesh";
+import { TriMesh, joinAllTris, refineAllLeaves } from "./mesh";
 import { computeHydro, type HydroStats } from "./hydro";
+import { computeRoad, snapToRoadGrid } from "./road";
 import { FRAG_SRC, VERT_SRC } from "./shaders";
 
 export type Tool =
@@ -47,6 +49,7 @@ export type Tool =
   | "lower"
   | "subdivide"
   | "coalesce"
+  | "road"
   | "pan";
 
 export interface Stats {
@@ -57,6 +60,7 @@ export interface Stats {
   lakes: number;
   swamps: number;
   trunks: number;
+  roads: number;
   hydroMs: number;
   mapW: number;
   mapH: number;
@@ -70,6 +74,8 @@ export interface HoverCorner {
   river: number;
   lake: number;
   fill: number;
+  lvl: number;
+  road: number;
   dominant: number;
 }
 
@@ -89,7 +95,9 @@ interface PaintChange {
 type Op =
   | { kind: "paint"; changes: PaintChange[] }
   | { kind: "subdivide"; parents: TriKey[] }
-  | { kind: "coalesce"; parent: TriKey };
+  | { kind: "coalesce"; parent: TriKey }
+  | { kind: "joinAll"; restore: TriKey[] }
+  | { kind: "roads"; prev: RoadSeg[]; next: RoadSeg[] };
 
 export interface EngineCallbacks {
   onStats?: (s: Stats) => void;
@@ -103,11 +111,17 @@ interface RenderMesh {
   lineCount: number;
 }
 
-const STRIDE = 12; // x, y, elev, z | w0..w3 | w4, w5, moist, river
+const STRIDE = 16; // x, y, elev, z | w0..w3 | w4, w5, moist, river | road, 0, 0, 0
 const ELEV_SCALE = 0.6;
 const SAVE_KEY = "isotri.doc.v2";
 const ELEV_MIN = -0.55;
 const ELEV_MAX = 2.1;
+/**
+ * Cap for the one-click "Refine all" pass. Whole-map detail beyond this
+ * makes the rebuild-per-stroke renderer (O(leaves)) choppy and bloats the
+ * auto-saved document; the per-tile Subdivide tool still goes to L6.
+ */
+const GLOBAL_MAX_LEVEL = 2;
 
 function compile(gl: WebGL2RenderingContext, type: number, src: string) {
   const sh = gl.createShader(type)!;
@@ -134,7 +148,11 @@ export class IsoTriEngine {
   /** World geometry — part of the document, selectable in the editor. */
   private geo: MapGeometry = GEO;
 
-  tool: Tool = "paint";
+  private _tool: Tool = "paint";
+  /** Pending road start point while the Road tool is active. */
+  private roadFrom: VertexKey | null = null;
+  /** Display toggle for the road overlay. */
+  showRoads = true;
   material = 2; // grass
   brushSize = 1.4;
   showWireframe = false;
@@ -159,9 +177,13 @@ export class IsoTriEngine {
   private lineIbo: WebGLBuffer;
   private pointVao: WebGLVertexArrayObject;
   private pointVbo: WebGLBuffer;
+  private roadVao: WebGLVertexArrayObject;
+  private roadVbo: WebGLBuffer;
+  private roadIbo: WebGLBuffer;
   private u: Record<string, WebGLUniformLocation | null> = {};
 
   private r: RenderMesh | null = null;
+  private roadTriCount = 0;
   private pointData: Float32Array | null = null;
   private dirty = true;
   private raf = 0;
@@ -219,6 +241,7 @@ export class IsoTriEngine {
       "uFlatColor",
       "uPointSize",
       "uRiverOn",
+      "uRoadOn",
     ]) {
       this.u[name] = gl.getUniformLocation(prog, name);
     }
@@ -229,8 +252,12 @@ export class IsoTriEngine {
     this.lineIbo = gl.createBuffer()!;
     this.pointVao = gl.createVertexArray()!;
     this.pointVbo = gl.createBuffer()!;
+    this.roadVao = gl.createVertexArray()!;
+    this.roadVbo = gl.createBuffer()!;
+    this.roadIbo = gl.createBuffer()!;
 
-    // static VAO setup: attrib 0 = pos(vec4), 1 = mats(vec4), 2 = extras(vec4)
+    // static VAO setup: attrib 0 = pos(vec4), 1 = mats(vec4), 2 = extras(vec4),
+    // 3 = road(vec4)
     const setupVao = (vao: WebGLVertexArrayObject, vbo: WebGLBuffer) => {
       gl.bindVertexArray(vao);
       gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
@@ -241,10 +268,13 @@ export class IsoTriEngine {
       gl.vertexAttribPointer(1, 4, gl.FLOAT, false, s, 16);
       gl.enableVertexAttribArray(2);
       gl.vertexAttribPointer(2, 4, gl.FLOAT, false, s, 32);
+      gl.enableVertexAttribArray(3);
+      gl.vertexAttribPointer(3, 4, gl.FLOAT, false, s, 48);
       gl.bindVertexArray(null);
     };
     setupVao(this.vao, this.vbo);
     setupVao(this.pointVao, this.pointVbo);
+    setupVao(this.roadVao, this.roadVbo);
 
     if (!this.tryLoad()) {
       this.resetWorld(this.seed);
@@ -320,6 +350,19 @@ export class IsoTriEngine {
     this.scheduleSave();
   }
 
+  /** Tool switching clears a pending road start point. */
+  get tool(): Tool {
+    return this._tool;
+  }
+
+  set tool(t: Tool) {
+    this._tool = t;
+    if (t !== "road" && this.roadFrom) {
+      this.roadFrom = null;
+      this.cb.onToast?.("Road cancelled");
+    }
+  }
+
   /**
    * Fine-layer hydrology detail (trunk seeding + lake-level clamping on
    * refined tiles). A derivation toggle: coarse views never change.
@@ -333,6 +376,68 @@ export class IsoTriEngine {
     this.field.setFineHydro(on);
     this.dirty = true;
     this.emitStats();
+  }
+
+  // ---------------- whole-mesh subdivision ----------------
+
+  /**
+   * Refine every tile one level (capped at GLOBAL_MAX_LEVEL for the whole
+   * map). One undo step. Returns the number of parents subdivided (0 =
+   * nothing to do).
+   */
+  subdivideAll(): number {
+    const parents = refineAllLeaves(this.mesh, GLOBAL_MAX_LEVEL);
+    if (parents.length === 0) {
+      this.cb.onToast?.(
+        `Whole-map detail is already at L${GLOBAL_MAX_LEVEL} — use the Subdivide tool for deeper tiles`
+      );
+      return 0;
+    }
+    this.materializeLeafCorners();
+    this.undoStack.push({ kind: "subdivide", parents });
+    this.redoStack = [];
+    this.scheduleRebuild();
+    this.emitStats();
+    this.scheduleSave();
+    return parents.length;
+  }
+
+  /**
+   * Merge the entire mesh back to its base tiles. One undo step (undo
+   * re-subdivides the stored restore order; redo re-joins). Returns the
+   * number of blocks coalesced (0 = already coarsest).
+   */
+  coalesceAll(): number {
+    const restore = joinAllTris(this.mesh);
+    if (restore.length === 0) {
+      this.cb.onToast?.("Mesh is already at the coarsest level");
+      return 0;
+    }
+    this.pruneMaterialized();
+    this.undoStack.push({ kind: "joinAll", restore });
+    this.redoStack = [];
+    this.scheduleRebuild();
+    this.emitStats();
+    this.scheduleSave();
+    return restore.length;
+  }
+
+  /**
+   * Drop fine vertices that no current leaf uses anymore (after a global
+   * join). Painted overrides on those vertices are KEPT — they re-apply
+   * if the area is refined again.
+   */
+  private pruneMaterialized(): void {
+    const keep = new Set<VertexKey>();
+    for (let j = 0; j <= this.geo.h; j++)
+      for (let i = 0; i <= this.geo.w; i++) keep.add(vk(i * FIX, j * FIX));
+    for (const key of this.mesh.leaves) {
+      const t = this.mesh.get(key);
+      if (!t) continue;
+      for (const c of triCorners(t.L, t.o, t.i, t.j)) keep.add(vk(c[0], c[1]));
+    }
+    for (const key of this.field.materialized)
+      if (!keep.has(key)) this.field.materialized.delete(key);
   }
 
   // ---------------- persistence ----------------
@@ -360,6 +465,8 @@ export class IsoTriEngine {
       geo: { w: this.geo.w, h: this.geo.h },
       ov,
       subdiv: subdiv.map((s) => s.k),
+      // roads are authored segments — stored flat: [a1,b1,a2,b2, ...]
+      roads: this.field.roadSegs.flatMap((s) => [s.a1, s.b1, s.a2, s.b2]),
     });
   }
 
@@ -369,6 +476,7 @@ export class IsoTriEngine {
     geo: { w: number; h: number };
     ov: [VertexKey, Override][];
     subdiv: TriKey[];
+    roads: RoadSeg[];
   } | null {
     try {
       const d = JSON.parse(json) as {
@@ -378,6 +486,7 @@ export class IsoTriEngine {
         geo?: { w?: number; h?: number };
         ov?: [string, { e?: number; m?: number; w?: number[] }][];
         subdiv?: string[];
+        roads?: number[];
       };
       if (!d || d.v !== 1 || typeof d.seed !== "number") return null;
       // worlds saved before size selection have no geo field: 30×22 default
@@ -407,12 +516,31 @@ export class IsoTriEngine {
       subdiv.sort(
         (a, b) => parseInt(a.split(":")[0], 10) - parseInt(b.split(":")[0], 10)
       );
+      // roads: flat [a1,b1,a2,b2, ...] in fixed-point lattice coords
+      const roads: RoadSeg[] = [];
+      if (d.roads !== undefined) {
+        if (
+          !Array.isArray(d.roads) ||
+          d.roads.length % 4 !== 0 ||
+          !d.roads.every((x) => typeof x === "number" && isFinite(x))
+        )
+          return null;
+        for (let i = 0; i < d.roads.length; i += 4) {
+          roads.push({
+            a1: d.roads[i],
+            b1: d.roads[i + 1],
+            a2: d.roads[i + 2],
+            b2: d.roads[i + 3],
+          });
+        }
+      }
       return {
         seed: Math.floor(d.seed),
         thrMult: typeof d.thrMult === "number" ? d.thrMult : 1,
         geo,
         ov,
         subdiv,
+        roads,
       };
     } catch {
       return null;
@@ -435,6 +563,7 @@ export class IsoTriEngine {
     this.field.materializeRoots(this.geo.w, this.geo.h);
     this.field.setFineHydro(this.fineDetailPref);
     for (const [key, o] of doc.ov) this.field.overrides.set(key, o);
+    this.field.setRoads(doc.roads);
     for (const k of doc.subdiv) {
       const t = this.mesh.get(k);
       if (t) this.mesh.subdivide(k, false);
@@ -571,7 +700,8 @@ export class IsoTriEngine {
         verts.push(
           x, y, v.elev, v.z,
           v.w[0], v.w[1], v.w[2], v.w[3],
-          v.w[4], v.w[5], v.moist, v.river
+          v.w[4], v.w[5], v.moist, v.river,
+          v.road, 0, 0, 0
         );
       }
       // mesh: fan from polygon vertex 0
@@ -611,7 +741,8 @@ export class IsoTriEngine {
       pts.push(
         x, y, v.elev, v.z,
         v.w[0], v.w[1], v.w[2], v.w[3],
-        v.w[4], v.w[5], v.moist, v.river
+        v.w[4], v.w[5], v.moist, v.river,
+        v.road, 0, 0, 0
       );
     }
     this.pointData = new Float32Array(pts);
@@ -619,6 +750,54 @@ export class IsoTriEngine {
     gl.bindBuffer(gl.ARRAY_BUFFER, this.pointVbo);
     gl.bufferData(gl.ARRAY_BUFFER, this.pointData, gl.DYNAMIC_DRAW);
     gl.bindVertexArray(null);
+
+    // ---- road overlay quads ----
+    // The road PATH lives on level-2 vertices, between the roots of the
+    // coarse mesh — corner stamps alone can never show it at L0/L1. So the
+    // segments are also emitted as thin world-space quads that drape over
+    // the terrain and render at EVERY level of detail (the fine-tile stamp
+    // adds the wide, wobbled dirt channel on refined meshes on top).
+    const rq: number[] = [];
+    const rqi: number[] = [];
+    if (this.field.roadSegs.length > 0) {
+      const HALF = 0.08; // half road width, world units
+      const LIFT = 0.03; // sit a hair above the ground
+      for (const s of this.field.roadSegs) {
+        const [ax, ay] = worldXY(s.a1, s.b1);
+        const [bx, by] = worldXY(s.a2, s.b2);
+        const va = field.value(vk(s.a1, s.b1));
+        const vb = field.value(vk(s.a2, s.b2));
+        const za = va.z + LIFT;
+        const zb = vb.z + LIFT;
+        // screen-space direction of the segment, then its perpendicular,
+        // mapped back through the linear iso transform into world space
+        const dix = bx - by - (ax - ay);
+        const diy = (bx + by) * 0.5 - (ax + ay) * 0.5;
+        const len = Math.hypot(dix, diy);
+        if (len < 1e-9) continue;
+        const pIx = -diy / len;
+        const pIy = dix / len;
+        const pwx = (0.5 * pIx + pIy) * HALF;
+        const pwy = (-0.5 * pIx + pIy) * HALF;
+        const water = (va.w[0] + vb.w[0]) * 0.5;
+        const base = rq.length / STRIDE;
+        // corners: A-perp, A+perp, B-perp, B+perp
+        rq.push(ax - pwx, ay - pwy, 0, za, water, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0);
+        rq.push(ax + pwx, ay + pwy, 0, za, water, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0);
+        rq.push(bx - pwx, by - pwy, 0, zb, water, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0);
+        rq.push(bx + pwx, by + pwy, 0, zb, water, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0);
+        rqi.push(base, base + 1, base + 2, base + 1, base + 3, base + 2);
+      }
+    }
+    const roadData = new Float32Array(rq);
+    const roadIdx = new Uint32Array(rqi);
+    gl.bindVertexArray(this.roadVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.roadVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, roadData, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.roadIbo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, roadIdx, gl.DYNAMIC_DRAW);
+    gl.bindVertexArray(null);
+    this.roadTriCount = roadIdx.length;
   }
 
   // ---------------- loop ----------------
@@ -672,10 +851,21 @@ export class IsoTriEngine {
       Math.max(2.5, Math.min(6, this.zoom * this.dpr * 0.05))
     );
     gl.uniform1f(this.u.uRiverOn!, this.showRivers ? 1 : 0);
+    gl.uniform1f(this.u.uRoadOn!, this.showRoads ? 1 : 0);
 
     gl.bindVertexArray(this.vao);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.triIbo);
     gl.drawElements(gl.TRIANGLES, this.r!.triCount, gl.UNSIGNED_INT, 0);
+
+    // road overlay quads — drawn over the terrain (a road fords/bridges
+    // rivers on top of them), independent of the mesh level of detail
+    if (this.showRoads && this.roadTriCount > 0) {
+      gl.uniform1i(this.u.uMode!, 3);
+      gl.bindVertexArray(this.roadVao);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.roadIbo);
+      gl.drawElements(gl.TRIANGLES, this.roadTriCount, gl.UNSIGNED_INT, 0);
+      gl.bindVertexArray(this.vao);
+    }
 
     if (this.showWireframe && this.r!.lineCount > 0) {
       gl.uniform1i(this.u.uMode!, 2);
@@ -716,6 +906,7 @@ export class IsoTriEngine {
       lakes: this.lastHydro?.lakes ?? 0,
       swamps: this.lastHydro?.swamps ?? 0,
       trunks: this.lastHydro?.trunks ?? 0,
+      roads: this.field.roadSegs.length,
       hydroMs: this.lastHydro?.ms ?? 0,
       mapW: this.geo.w,
       mapH: this.geo.h,
@@ -813,6 +1004,10 @@ export class IsoTriEngine {
       this.applyElevBrush(wx, wy);
       return;
     }
+    if (this.tool === "road") {
+      this.roadClick(wx, wy);
+      return;
+    }
     const leafKey = this.mesh.locateWorld(wx, wy);
     if (!leafKey) return;
     if (this.tool === "subdivide") {
@@ -857,6 +1052,60 @@ export class IsoTriEngine {
     }
   }
 
+  /** Road tool: first click sets the start, second routes and stamps. */
+  private roadClick(wx: number, wy: number): void {
+    const target = snapToRoadGrid(this.field, wx, wy);
+    if (!this.roadFrom) {
+      if (this.field.value(target).w[0] > 0.55) {
+        this.cb.onToast?.("Roads have to start on land");
+        return;
+      }
+      this.roadFrom = target;
+      this.cb.onToast?.("Road: now click a destination (Esc cancels)");
+      return;
+    }
+    const from = this.roadFrom;
+    this.roadFrom = null;
+    if (this.field.value(target).w[0] > 0.55) {
+      this.cb.onToast?.("Roads have to end on land");
+      return;
+    }
+    const res = computeRoad(this.field, from, target);
+    if (!res || res.segs.length === 0) {
+      this.cb.onToast?.("No land route found — the sea blocks every path");
+      return;
+    }
+    const prev = this.field.roadSegs;
+    const next = [...prev, ...res.segs];
+    this.field.setRoads(next);
+    this.undoStack.push({ kind: "roads", prev, next });
+    this.redoStack = [];
+    this.scheduleRebuild();
+    this.emitStats();
+    this.scheduleSave();
+    const st = res.stats;
+    const parts: string[] = [`${st.length.toFixed(1)} units`];
+    if (st.bridges > 0)
+      parts.push(`${st.bridges} bridge${st.bridges > 1 ? "s" : ""}`);
+    if (st.fords > 0) parts.push(`${st.fords} ford${st.fords > 1 ? "s" : ""}`);
+    this.cb.onToast?.(
+      `Road built: ${parts.join(", ")} (${st.ms.toFixed(0)}ms)`
+    );
+  }
+
+  /** Remove every road (one undo step). */
+  clearRoads(): number {
+    const prev = this.field.roadSegs;
+    if (prev.length === 0) return 0;
+    this.field.setRoads([]);
+    this.undoStack.push({ kind: "roads", prev, next: [] });
+    this.redoStack = [];
+    this.scheduleRebuild();
+    this.emitStats();
+    this.scheduleSave();
+    return prev.length;
+  }
+
   private endStroke(): void {
     if (!this.painting) return;
     this.painting = false;
@@ -880,6 +1129,13 @@ export class IsoTriEngine {
         if (this.mesh.get(pk)) this.mesh.subdivide(pk, true);
       }
       this.materializeLeafCorners();
+    } else if (op.kind === "joinAll") {
+      // re-join: restore list is shallowest-first, coalesce deepest-first
+      for (let i = op.restore.length - 1; i >= 0; i--)
+        this.mesh.coalesce(op.restore[i], true);
+      this.pruneMaterialized();
+    } else if (op.kind === "roads") {
+      this.field.setRoads(op.next);
     } else {
       if (this.mesh.get(op.parent)) this.mesh.subdivide(op.parent, false);
     }
@@ -891,6 +1147,14 @@ export class IsoTriEngine {
     } else if (op.kind === "subdivide") {
       for (let i = op.parents.length - 1; i >= 0; i--)
         this.mesh.coalesce(op.parents[i], true);
+    } else if (op.kind === "joinAll") {
+      // undo the join: rebuild the exact hierarchy from restore order
+      for (const k of op.restore) {
+        if (this.mesh.get(k)) this.mesh.subdivide(k, false);
+      }
+      this.materializeLeafCorners();
+    } else if (op.kind === "roads") {
+      this.field.setRoads(op.prev);
     } else {
       this.mesh.coalesce(op.parent, true);
     }
@@ -954,6 +1218,8 @@ export class IsoTriEngine {
           river: v.river,
           lake: v.lake,
           fill: v.fill,
+          lvl: v.lvl,
+          road: v.road,
           dominant: this.field.dominant(v.w),
         };
       });
@@ -1051,6 +1317,9 @@ export class IsoTriEngine {
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
       e.preventDefault();
       this.redo();
+    } else if (e.key === "Escape" && this.roadFrom) {
+      this.roadFrom = null;
+      this.cb.onToast?.("Road cancelled");
     }
   };
 

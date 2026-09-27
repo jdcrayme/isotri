@@ -25,6 +25,18 @@
  *            hydrology stamps, inherited at finer layers with NO noise, so
  *            refined water surfaces can be clamped flat to it (lake-level
  *            clamping).
+ *   lvl    — river water level (pool-and-drop profile, monotone downstream).
+ *            Carried at roots from hydrology stamps, inherited at finer
+ *            layers with NO noise, and re-stamped from trunk segments on
+ *            refined vertices. The rendered surface is clamped to it inside
+ *            the channel: terrain above is CUT down to the level (canyon),
+ *            terrain below is FILLED up to it (water over a dug bed) — the
+ *            water surface itself is always level and never climbs.
+ *
+ * Flat-water contract (all water renders LEVEL):
+ *   sea    z = 0 (one plane at sea level; the bed stays in elev)
+ *   lake   z = fill (spill level)
+ *   river  z = lvl (pool level; monotone downstream by construction)
  *
  * Fine-layer hydrology inheritance (phase 3):
  *   The coarse solve also emits its drainage network as TRUNK SEGMENTS
@@ -70,6 +82,8 @@ export interface VV {
   river: number;
   lake: number;
   fill: number; // local water level (spill elevation near water)
+  lvl: number; // river water level (pool-and-drop, monotone downstream)
+  road: number; // 0..1 stamped road strength (overlay channel, all LODs)
 }
 
 /**
@@ -77,6 +91,10 @@ export interface VV {
  * core for fine-layer trunk seeding. Coordinates are FIXED-POINT lattice
  * coords of the two root endpoints; `q` is the channel strength (0..1) at
  * the source — the fine distance field reproduces width ∝ √Q from it.
+ * `la`/`lb` are the WATER LEVELS at the two endpoints (source -> receiver,
+ * monotone downstream): refined vertices re-stamp the level from the
+ * winning segment so flat pools stay flat along the meandered channel.
+ * Optional so legacy callers (preview scripts) stay valid.
  */
 export interface TrunkSeg {
   a1: number;
@@ -84,6 +102,21 @@ export interface TrunkSeg {
   a2: number;
   b2: number;
   q: number;
+  la?: number;
+  lb?: number;
+}
+
+/**
+ * One road edge on the level-2 lattice, emitted by the road solver
+ * (road.ts) and stored in the document — roads are AUTHORED infrastructure
+ * (the user chose the endpoints), unlike the derived drainage network.
+ * Coordinates are fixed-point lattice coords of the two endpoints.
+ */
+export interface RoadSeg {
+  a1: number;
+  b1: number;
+  a2: number;
+  b2: number;
 }
 
 /** Partial user override — only the fields the user actually touched. */
@@ -98,6 +131,7 @@ export interface HydroStamp {
   river: number; // 0..1 channel strength
   fill: number; // filled (spill) elevation for flat lake surfaces
   boost: number; // moisture boost from discharge / wetlands
+  lvl: number; // river water level (pool-and-drop, monotone downstream)
 }
 
 export interface MapGeometry {
@@ -257,6 +291,12 @@ function ampWeight(L: number): number {
 /** Peak amplitude (world units) of the deterministic meander wobble. */
 const TRUNK_MEANDER = 0.36;
 
+/** Peak amplitude (world units) of the deterministic road wobble. */
+const ROAD_WOBBLE = 0.06;
+
+/** Road stamp half-width (world units) — a narrow path, not a river. */
+const ROAD_HALF_WIDTH = 0.17;
+
 /**
  * Channel half-width (world units) for a trunk of strength q — matched to
  * the coarse view, where a vertex with stamp q falls to the shader's
@@ -304,6 +344,10 @@ export class VertexField {
   fineHydro = true;
   /** Spatial hash of drainage trunk segments (cell -> segments). */
   private trunkGrid = new Map<number, TrunkSeg[]>();
+  /** Authored road segments (persisted in the document). */
+  roadSegs: RoadSeg[] = [];
+  /** Spatial hash of road segments (cell -> segments). */
+  private roadGrid = new Map<number, RoadSeg[]>();
   /** Derived-value cache (invalidated wholesale on any edit — cheap). */
   private cache = new Map<VertexKey, VV>();
   /** Vertices that exist (level-0 grid + every created midpoint). */
@@ -347,7 +391,9 @@ export class VertexField {
     let z: number;
     let lake: number;
     let river: number;
+    let road: number;
     let fill: number;
+    let lvl: number;
     let w: Float32Array | null = null;
 
     if (L === 0) {
@@ -357,7 +403,9 @@ export class VertexField {
       z = elev;
       lake = 0;
       river = 0;
+      road = 0;
       fill = elev;
+      lvl = elev; // only meaningful where a river/lake stamp lands
     } else {
       const parents = vertexParents(a, b)!;
       const p1 = this.value(parents[0]);
@@ -371,7 +419,9 @@ export class VertexField {
       );
       lake = (p1.lake + p2.lake) * 0.5;
       river = (p1.river + p2.river) * 0.5; // rivers stay crisp: no noise
+      road = (p1.road + p2.road) * 0.5; // roads stay crisp: no noise
       fill = (p1.fill + p2.fill) * 0.5; // water level inherits smoothly
+      lvl = (p1.lvl + p2.lvl) * 0.5; // river level inherits smoothly (no noise)
       // land gets the relief noise; lakes stay flat at their surface level
       z = (p1.z + p2.z) * 0.5 + ne * (1 - clamp(lake, 0, 1));
 
@@ -385,22 +435,39 @@ export class VertexField {
         const [wx, wy] = worldXY(a, b);
         const sx = wx + (valueNoise(wx * 1.9 + 41.3, wy * 1.9 + 17.9, this.seed ^ 0x51ab) - 0.5) * TRUNK_MEANDER;
         const sy = wy + (valueNoise(wx * 1.7 + 91.2, wy * 1.7 + 33.7, this.seed ^ 0x9e21) - 0.5) * TRUNK_MEANDER;
-        const s = this.trunkRiverAt(sx, sy);
-        if (s > river) river = s;
+        const st = this.trunkStampAt(sx, sy);
+        if (st.s > river) {
+          river = st.s;
+          // the winning segment also carries the local WATER LEVEL (linear
+          // along the segment), so flat pools stay flat along the meandered
+          // centerline instead of following the straight interpolation
+          if (!Number.isNaN(st.lvl)) lvl = st.lvl;
+        }
       }
 
       const aw = ampWeight(L);
+      // material noise fades out over open water: deep sea must stay water
+      // at every LOD (otherwise noisy weights classify speckles of "sand"
+      // that pop out of the flat sea plane), while land keeps full grain
+      const wNoise = aw * (1 - clamp((p1.w[0] + p2.w[0]) * 0.5, 0, 1));
       w = new Float32Array(K);
       for (let i = 0; i < K; i++) {
         const base = (p1.w[i] + p2.w[i]) * 0.5;
-        const n = (hash3(a, b, this.seed ^ (0x1111 * (i + 1))) * 2 - 1) * aw;
+        const n = (hash3(a, b, this.seed ^ (0x1111 * (i + 1))) * 2 - 1) * wNoise;
         w[i] = Math.max(0, base + n);
       }
     }
 
     // ---- user overrides (partial) ----
     if (ov) {
-      if (ov.elev !== undefined) elev = ov.elev;
+      if (ov.elev !== undefined) {
+        elev = ov.elev;
+        // painted terrain must move the RENDERED surface too: z was captured
+        // from the seed terrain above, so without this the surface would
+        // stay at the seed height no matter how the land is sculpted (only
+        // a lake clamp ever corrected it).
+        z = ov.elev;
+      }
       if (ov.moist !== undefined) moist = clamp(ov.moist, 0, 1);
     }
 
@@ -411,6 +478,25 @@ export class VertexField {
       if (hs.lake > lake) lake = hs.lake;
       if (hs.boost > 0) moist = clamp(moist + hs.boost, 0, 1);
       fill = hs.fill;
+      lvl = hs.lvl;
+    }
+
+    // ---- road network stamping (authored infrastructure, ALL levels) ----
+    // The path segments live on the level-2 lattice; every vertex samples
+    // the same smooth distance field of them, so roads render crisp at
+    // every LOD (and bridge over water — lakes never swallow a road).
+    if (this.roadGrid.size > 0) {
+      const [wx, wy] = worldXY(a, b);
+      const rx =
+        wx +
+        (valueNoise(wx * 2.3 + 71.9, wy * 2.3 + 5.1, this.seed ^ 0x33d1) - 0.5) *
+          ROAD_WOBBLE;
+      const ry =
+        wy +
+        (valueNoise(wx * 2.1 + 13.7, wy * 2.1 + 47.3, this.seed ^ 0x77c2) - 0.5) *
+          ROAD_WOBBLE;
+      const s = this.roadAt(rx, ry);
+      if (s > road) road = s;
     }
 
     // ---- finalize weights ----
@@ -422,9 +508,23 @@ export class VertexField {
     }
     const wf = w as Float32Array;
 
-    // lakes flatten the surface and flood the weight vector
+    // ---- flat water: sea, lakes, rivers ----
+    // The rendered surface is the WATER SURFACE wherever water dominates;
+    // the terrain beneath (a carved channel, a dug basin, the sea floor)
+    // stays in `elev` and feeds the depth shading. The three surfaces:
+    //   sea    one plane at 0 (elev <= 0 region)
+    //   lake   the spill (fill) level
+    //   river  the pool-and-drop level (lvl) — monotone downstream by
+    //          construction, so a river can never render uphill: the stamp
+    //          can only CUT the channel down to the level or FILL it up
     const lakeS = smoothstep(0.2, 0.62, lake);
+    const riverS = smoothstep(0.16, 0.48, river) * (1 - lakeS);
     let zFinal = z;
+
+    // open sea: one flat plane at sea level (depth shading reads elev below)
+    const seaS = 1 - smoothstep(-0.025, 0.005, elev);
+    zFinal += (0 - zFinal) * seaS;
+
     if (hs && lakeS > 0) {
       // roots: flatten to the stamped spill level
       zFinal = elev + (hs.fill - elev) * lakeS;
@@ -434,6 +534,11 @@ export class VertexField {
       // shorelines stay crisp instead of soaking half the relief noise.
       zFinal = z + (fill - z) * lakeS;
     }
+
+    // river channel: pull the surface to the local water level — this cuts
+    // the channel through terrain that rises across it and fills it where
+    // the bed sits below the level (the bed itself lives on in elev)
+    if (riverS > 0) zFinal += (lvl - zFinal) * riverS;
 
     let out: Float32Array;
     if (lakeS > 0) {
@@ -447,7 +552,7 @@ export class VertexField {
       out = wf;
     }
 
-    return { elev, z: zFinal, moist, w: out, river, lake, fill };
+    return { elev, z: zFinal, moist, w: out, river, lake, fill, lvl, road };
   }
 
   /** All roots exist regardless of materialization (needed by inheritance). */
@@ -504,13 +609,19 @@ export class VertexField {
 
   /**
    * Distance-field stamp of the drainage network at a (wobbled) world
-   * point: the strongest channel contribution from nearby trunk segments.
+   * point: the strongest channel contribution from nearby trunk segments,
+   * together with the WATER LEVEL of the winning segment (interpolated
+   * along it by projection). Segments without levels (legacy callers)
+   * leave lvl = NaN so the caller keeps the interpolated level. The
+   * strict `>` keeps the FIRST strongest segment, and buckets iterate in
+   * rebuild order, so the result is deterministic.
    */
-  private trunkRiverAt(sx: number, sy: number): number {
+  private trunkStampAt(sx: number, sy: number): { s: number; lvl: number } {
     const C = VertexField.TRUNK_CELL;
     const cx = Math.floor(sx / C);
     const cy = Math.floor(sy / C);
     let best = 0;
+    let bestLvl = NaN;
     for (let ix = cx - 1; ix <= cx + 1; ix++) {
       for (let iy = cy - 1; iy <= cy + 1; iy++) {
         const bucket = this.trunkGrid.get(VertexField.trunkCellKey(ix, iy));
@@ -519,12 +630,88 @@ export class VertexField {
           const t = bucket[n];
           const [ax, ay] = worldXY(t.a1, t.b1);
           const [bx, by] = worldXY(t.a2, t.b2);
-          const d = distToSegment(sx, sy, ax, ay, bx, by);
+          const dx = bx - ax;
+          const dy = by - ay;
+          const len2 = dx * dx + dy * dy;
+          let tt = 0;
+          if (len2 > 1e-12)
+            tt = clamp(((sx - ax) * dx + (sy - ay) * dy) / len2, 0, 1);
+          const ex = sx - (ax + tt * dx);
+          const ey = sy - (ay + tt * dy);
+          const d = Math.sqrt(ex * ex + ey * ey);
           const hw = trunkHalfWidth(t.q);
           if (d >= hw) continue;
           // flat core out to 0.3·hw (so the centerline keeps the coarse
           // strength exactly), then a smooth bank falloff to the edge
           const s = t.q * (1 - smoothstep(hw * 0.3, hw, d));
+          if (s > best) {
+            best = s;
+            bestLvl =
+              t.la !== undefined && t.lb !== undefined
+                ? t.la + (t.lb - t.la) * tt
+                : NaN;
+          }
+        }
+      }
+    }
+    return { s: best, lvl: bestLvl };
+  }
+
+  // ---------------- road index ----------------
+
+  /** Replace the authored road network wholesale and invalidate derivations. */
+  setRoads(segs: RoadSeg[]): void {
+    this.roadSegs = segs;
+    this.rebuildRoadIndex(segs);
+    this.clearCache();
+  }
+
+  /** Spatial-hash cell size (world units) for the road index. */
+  private static readonly ROAD_CELL = 1.0;
+
+  private rebuildRoadIndex(segs: RoadSeg[]): void {
+    this.roadGrid.clear();
+    const C = VertexField.ROAD_CELL;
+    for (const t of segs) {
+      const [ax, ay] = worldXY(t.a1, t.b1);
+      const [bx, by] = worldXY(t.a2, t.b2);
+      const pad = ROAD_HALF_WIDTH + ROAD_WOBBLE + 0.05;
+      const x0 = Math.floor((Math.min(ax, bx) - pad) / C);
+      const x1 = Math.floor((Math.max(ax, bx) + pad) / C);
+      const y0 = Math.floor((Math.min(ay, by) - pad) / C);
+      const y1 = Math.floor((Math.max(ay, by) + pad) / C);
+      for (let cx = x0; cx <= x1; cx++) {
+        for (let cy = y0; cy <= y1; cy++) {
+          const k = VertexField.trunkCellKey(cx, cy);
+          const bucket = this.roadGrid.get(k);
+          if (bucket) bucket.push(t);
+          else this.roadGrid.set(k, [t]);
+        }
+      }
+    }
+  }
+
+  /**
+   * Distance-field stamp of the road network at a (wobbled) world point.
+   * Constant half-width, flat core then smooth shoulder — the road profile
+   * is uniform (no flow strength, unlike rivers).
+   */
+  private roadAt(sx: number, sy: number): number {
+    const C = VertexField.ROAD_CELL;
+    const cx = Math.floor(sx / C);
+    const cy = Math.floor(sy / C);
+    let best = 0;
+    for (let ix = cx - 1; ix <= cx + 1; ix++) {
+      for (let iy = cy - 1; iy <= cy + 1; iy++) {
+        const bucket = this.roadGrid.get(VertexField.trunkCellKey(ix, iy));
+        if (!bucket) continue;
+        for (let n = 0; n < bucket.length; n++) {
+          const t = bucket[n];
+          const [ax, ay] = worldXY(t.a1, t.b1);
+          const [bx, by] = worldXY(t.a2, t.b2);
+          const d = distToSegment(sx, sy, ax, ay, bx, by);
+          if (d >= ROAD_HALF_WIDTH) continue;
+          const s = 1 - smoothstep(ROAD_HALF_WIDTH * 0.25, ROAD_HALF_WIDTH, d);
           if (s > best) best = s;
         }
       }

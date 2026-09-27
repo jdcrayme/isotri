@@ -277,3 +277,45 @@ export class TriMesh {
     return this.locate(aF, bF);
   }
 }
+
+/**
+ * One global refinement pass: every leaf below `maxLevel` is subdivided
+ * once, cascading into coarser neighbours so the balance invariant holds
+ * throughout. Returns every parent key that was subdivided (deduped, in
+ * first-subdivision order) — the whole pass is one undo unit.
+ *
+ * Leaves at or above `maxLevel` are left alone, so hand-refined deep zones
+ * survive a global pass untouched (their surroundings still come up one
+ * level to meet the cap).
+ */
+export function refineAllLeaves(mesh: TriMesh, maxLevel: number): TriKey[] {
+  const snapshot = Array.from(mesh.leaves);
+  const parents = new Set<TriKey>();
+  for (const key of snapshot) {
+    const t = mesh.get(key);
+    if (!t || t.children || t.L >= maxLevel) continue;
+    for (const pk of mesh.subdivide(key, true)) parents.add(pk);
+  }
+  return Array.from(parents);
+}
+
+/**
+ * Merge the whole mesh back to its root triangles: every subdivided
+ * parent is coalesced deepest-first. The neighbour guard is bypassed
+ * (forced) because adjacent refinements would otherwise each block the
+ * other. Returns the coalesced parent keys in RESTORE order — shallowest
+ * first — so re-subdividing them in that order rebuilds the exact same
+ * hierarchy. That makes the returned list a complete undo unit:
+ *   undo -> subdivide(restore) in stored order
+ *   redo -> coalesce(restore) deepest-first (i.e. reversed, forced)
+ */
+export function joinAllTris(mesh: TriMesh): TriKey[] {
+  const parents: { key: TriKey; L: number }[] = [];
+  for (const [k, t] of mesh.tris) if (t.children) parents.push({ key: k, L: t.L });
+  if (parents.length === 0) return [];
+  parents.sort((a, b) => b.L - a.L || (a.key < b.key ? -1 : 1));
+  const coalesced: TriKey[] = [];
+  for (const p of parents) if (mesh.coalesce(p.key, true)) coalesced.push(p.key);
+  coalesced.reverse();
+  return coalesced;
+}

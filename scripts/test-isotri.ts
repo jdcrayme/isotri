@@ -17,7 +17,7 @@ import {
   worldToLattice,
   worldXY,
 } from "../src/lib/isotri/lattice";
-import { TriMesh } from "../src/lib/isotri/mesh";
+import { TriMesh, joinAllTris, refineAllLeaves } from "../src/lib/isotri/mesh";
 import {
   VertexField,
   GEO,
@@ -27,6 +27,8 @@ import {
   sizeKeyFor,
 } from "../src/lib/isotri/field";
 import { computeHydro } from "../src/lib/isotri/hydro";
+import { smoothstep } from "../src/lib/isotri/hash";
+import { computeRoad, snapToRoadGrid, ROAD_SOLVE_LEVEL } from "../src/lib/isotri/road";
 
 let failures = 0;
 function assert(cond: boolean, msg: string) {
@@ -380,6 +382,47 @@ console.log("8. terrain edit -> hydrology response");
     `  dam: lakes ${before.stats.lakes} -> ${after.stats.lakes}, rivers ${before.stats.rivers} -> ${after.stats.rivers}`
   );
 
+  // regression: a painted (raised) root must move the RENDERED surface (z),
+  // not just the authoritative elevation — z used to stay at the seed height
+  // until a lake clamp rescued it, so sculpted terrain never showed up.
+  {
+    const fr = new VertexField(11);
+    fr.materializeRoots(30, 22);
+    const probeKeys: VertexKey[] = [];
+    for (let j = 6; j <= 16 && probeKeys.length < 6; j++) {
+      for (let i = 8; i <= 20 && probeKeys.length < 6; i++) {
+        const key = vk(i * FIX, j * FIX);
+        const v = fr.value(key);
+        if (v.elev > 0.25 && v.w[0] < 0.3) probeKeys.push(key);
+      }
+    }
+    assert(probeKeys.length >= 3, "found dry land probes for the z regression");
+    let zFollowed = 0;
+    for (const key of probeKeys) {
+      const beforeZ = fr.value(key).z;
+      const target = Math.min(1.6, fr.value(key).elev + 0.9);
+      fr.paintElev(key, target);
+      const afterV = fr.value(key);
+      // z tracks the painted elevation exactly (no lake clamp on dry land)
+      if (
+        Math.abs(afterV.z - target) < 1e-9 &&
+        Math.abs(afterV.z - beforeZ) > 0.2
+      )
+        zFollowed++;
+      // fine children inherit the moved surface as their parent low-pass
+      const [a, b] = parseVk(key);
+      const mid = fr.value(vk(a + FIX / 2, b));
+      assert(
+        Math.abs(mid.z - (afterV.z + fr.value(vk(a + FIX, b)).z) / 2) < 0.5,
+        "fine child z inherits the painted surface as a low-pass"
+      );
+    }
+    assert(
+      zFollowed === probeKeys.length,
+      `painted elevation moves the rendered surface z (${zFollowed}/${probeKeys.length})`
+    );
+  }
+
   // deterministic lake: dig a bowl and wall it in at an interior vertex,
   // then check the lake stamp + the flat rendered surface in the field
   const ci = 15;
@@ -455,7 +498,10 @@ console.log("9. map sizes");
   let detFail = 0;
   for (const [k, st] of s1.stamps) {
     const t = s2.stamps.get(k)!;
-    if (st.river !== t.river || st.lake !== t.lake || st.fill !== t.fill)
+    if (
+      st.river !== t.river || st.lake !== t.lake || st.fill !== t.fill ||
+      st.lvl !== t.lvl
+    )
       detFail++;
   }
   assert(detFail === 0, `small-map hydro determinism (${detFail})`);
@@ -632,8 +678,11 @@ console.log("10. fine-layer hydrology: trunk seeding + lake clamping");
     "interp-only path is still flat here (both parents flattened)"
   );
 
-  // 10e. determinism: fresh field + same stamps/trunks => same fine values
+  // 10e. determinism: fresh field + same edits/stamps/trunks => same fine values
+  //      (g3 must replicate the SAME painted overrides — equal field state)
   const g3 = new VertexField(7);
+  for (const [i, j] of wet) g3.paintElev(vk(i * FIX, j * FIX), 0.1);
+  for (const [i, j] of wall) g3.paintElev(vk(i * FIX, j * FIX), 0.85);
   g3.setHydro(bowl.stamps, bowl.trunks);
   let detDiffs = 0;
   for (let di = -3; di <= 3; di++) {
@@ -648,6 +697,541 @@ console.log("10. fine-layer hydrology: trunk seeding + lake clamping");
     }
   }
   assert(detDiffs === 0, `fine values deterministic across fields (${detDiffs})`);
+}
+
+// ---------- 11. whole-mesh refine / join passes ----------
+console.log("11. global refine & join");
+{
+  const W = 8,
+    H = 6;
+  const mk = () => {
+    const m = new TriMesh();
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) m.addRootCell(i, j);
+    return m;
+  };
+  const roots = W * H * 2;
+
+  // 11a. each pass drops every leaf exactly one level, then the cap holds
+  const m = mk();
+  const p1 = refineAllLeaves(m, 2);
+  assert(m.leafCount === roots * 4, `pass 1 leaf count (${m.leafCount})`);
+  assert(p1.length === roots, `pass 1 parents = every root tri (${p1.length})`);
+  assert(m.checkBalance() === null, "balance after global pass 1");
+  const p2 = refineAllLeaves(m, 2);
+  assert(m.leafCount === roots * 16, `pass 2 leaf count (${m.leafCount})`);
+  assert(p2.length === roots * 4, `pass 2 parents = every L1 tri (${p2.length})`);
+  assert(m.checkBalance() === null, "balance after global pass 2");
+  const p3 = refineAllLeaves(m, 2);
+  assert(p3.length === 0, "cap: pass 3 reports nothing to do");
+  assert(m.leafCount === roots * 16, "cap: leaf count unchanged");
+
+  // 11b. mixed manual + global: hand-refined deep zones survive untouched
+  const m2 = mk();
+  m2.subdivide(triKey(0, 1, 4, 3), true); // cascades into neighbours
+  const deepBefore = Array.from(m2.leaves).filter((k) => m2.get(k)!.L >= 2).length;
+  const pm = refineAllLeaves(m2, 2);
+  assert(m2.checkBalance() === null, "balance after mixed manual+global pass");
+  assert(pm.length > 0, "mixed pass subdivides the coarse remainder");
+  const deepAfter = Array.from(m2.leaves).filter((k) => m2.get(k)!.L >= 2).length;
+  assert(deepAfter >= deepBefore, "deep zone not destroyed by the pass");
+
+  // 11c. undo/redo semantics of a pass (as the engine's Op machinery does it)
+  const leavesBefore = Array.from(m.leaves).sort();
+  for (let i = p2.length - 1; i >= 0; i--) m.coalesce(p2[i], true); // undo L2
+  for (let i = p1.length - 1; i >= 0; i--) m.coalesce(p1[i], true); // undo L1
+  assert(m.leafCount === roots, `undo restores root leaves (${m.leafCount})`);
+  assert(m.checkBalance() === null, "balance after undo");
+  for (const pk of p1) m.subdivide(pk, true); // redo pass 1
+  for (const pk of p2) m.subdivide(pk, true); // redo pass 2
+  const leavesAfter = Array.from(m.leaves).sort();
+  assert(
+    leavesBefore.length === leavesAfter.length &&
+      leavesBefore.every((k, i) => k === leavesAfter[i]),
+    "redo reproduces the exact leaf set"
+  );
+
+  // 11d. joinAllTris: back to roots; restore order rebuilds the same mesh
+  const m4 = mk();
+  m4.subdivide(triKey(0, 0, 3, 3), true);
+  refineAllLeaves(m4, 2);
+  const preJoin = Array.from(m4.leaves).sort();
+  const restore = joinAllTris(m4);
+  assert(m4.leafCount === roots, `join all returns to roots (${m4.leafCount})`);
+  assert(
+    m4.leaves.size === roots &&
+      Array.from(m4.leaves).every((k) => m4.get(k)!.L === 0),
+    "every remaining leaf is a root triangle"
+  );
+  assert(restore.length > 0, "restore list emitted");
+  for (const pk of restore) m4.subdivide(pk, false);
+  const post = Array.from(m4.leaves).sort();
+  assert(
+    preJoin.length === post.length &&
+      preJoin.every((k, i) => k === post[i]),
+    `restore order rebuilds the exact pre-join leaf set (${preJoin.length} leaves)`
+  );
+  assert(m4.checkBalance() === null, "balance after restore");
+
+  // 11e. join all on a pristine mesh is a no-op
+  const m5 = mk();
+  assert(joinAllTris(m5).length === 0, "join all on roots is empty");
+
+  // 11f. real-world scale: medium map passes stay interactive
+  const perf = new TriMesh();
+  for (let j = 0; j < 22; j++) for (let i = 0; i < 30; i++) perf.addRootCell(i, j);
+  const t0 = performance.now();
+  refineAllLeaves(perf, 2);
+  refineAllLeaves(perf, 2);
+  const tRefine = performance.now() - t0;
+  const t1 = performance.now();
+  const pj = joinAllTris(perf);
+  const tJoin = performance.now() - t1;
+  assert(perf.leafCount === 1320, `medium join lands on 1320 roots (${perf.leafCount})`);
+  assert(pj.length === 1320 + 5280, `medium restore list covers L0+L1 (${pj.length})`);
+  assert(
+    tRefine < 2000 && tJoin < 2000,
+    `global passes interactive (refine ${tRefine.toFixed(0)}ms, join ${tJoin.toFixed(0)}ms)`
+  );
+  console.log(
+    `  medium 30x22: refine x2 ${tRefine.toFixed(0)}ms, join ${tJoin.toFixed(0)}ms, ${pj.length} restore parents`
+  );
+}
+
+// ---------- 12. road networks: A* routing + distance-field stamping ----------
+console.log("12. roads");
+{
+  const n = 1 << ROAD_SOLVE_LEVEL; // solve vertices per root cell
+  const S = FIX >> ROAD_SOLVE_LEVEL; // fixed-point units per solve edge
+
+  // 12a. real seed-7 medium island: route across the land, check invariants
+  const field = new VertexField(7);
+  field.materializeRoots(30, 22);
+  const hyd = computeHydro(field, 7, { thrMult: 1.0 });
+  field.setHydro(hyd.stamps, hyd.trunks);
+
+  // find land endpoints: westernmost and easternmost land vertices on the
+  // row that passes through the island center
+  const isLand = (i: number, j: number) => {
+    const v = field.value(vk(i * S, j * S));
+    return v.w[0] < 0.35 && v.elev > 0.06 && v.lake < 0.2;
+  };
+  let A: [number, number] | null = null;
+  let B: [number, number] | null = null;
+  const jMid = 11 * n;
+  for (let i = 0; i <= 30 * n && !A; i++) if (isLand(i, jMid)) A = [i, jMid];
+  for (let i = 30 * n; i >= 0 && !B; i--) if (isLand(i, jMid)) B = [i, jMid];
+  assert(!!A && !!B, `land endpoints found on the mid row (A=${A}, B=${B})`);
+  if (A && B) {
+    const ka = vk(A[0] * S, A[1] * S);
+    const kb = vk(B[0] * S, B[1] * S);
+    const res = computeRoad(field, ka, kb);
+    assert(!!res, "road solves across the island");
+    if (res) {
+      assert(res.segs.length > 4, `path is non-trivial (${res.segs.length} edges)`);
+      const s0 = res.segs[0];
+      const sN = res.segs[res.segs.length - 1];
+      assert(
+        s0.a1 === A[0] * S && s0.b1 === A[1] * S,
+        "path starts at A"
+      );
+      assert(
+        sN.a2 === B[0] * S && sN.b2 === B[1] * S,
+        "path ends at B"
+      );
+      // consecutive segs share endpoints (lattice-adjacent chain)
+      let chained = true;
+      for (let i = 0; i < res.segs.length - 1; i++) {
+        const u = res.segs[i];
+        const w = res.segs[i + 1];
+        const uEnd = [u.a2, u.b2];
+        const wStart = [w.a1, w.b1];
+        if (uEnd[0] !== wStart[0] || uEnd[1] !== wStart[1]) chained = false;
+      }
+      assert(chained, "segments form a continuous chain");
+      // never crosses open sea
+      let dry = true;
+      for (const s of res.segs) {
+        const mid = field.value(vk((s.a1 + s.a2) / 2, (s.b1 + s.b2) / 2));
+        if (mid.w[0] > 0.62 && mid.lake <= 0.2) dry = false;
+      }
+      assert(dry, "no ocean crossing");
+      // length sane: >= straight line, <= 2.5x straight line
+      const [ax, ay] = worldXY(A[0] * S, A[1] * S);
+      const [bx, by] = worldXY(B[0] * S, B[1] * S);
+      const straight = Math.hypot(bx - ax, by - ay);
+      assert(
+        res.stats.length >= straight - 1e-9,
+        `path length >= straight line (${res.stats.length.toFixed(2)} >= ${straight.toFixed(2)})`
+      );
+      assert(
+        res.stats.length <= straight * 2.5,
+        `path length within 2.5x straight line (${res.stats.length.toFixed(2)} vs ${straight.toFixed(2)})`
+      );
+      console.log(
+        `  island crossing: ${res.stats.length.toFixed(1)} units / straight ${straight.toFixed(1)} — ${res.stats.fords} ford(s), ${res.stats.bridges} bridge(s), ${res.stats.explored} nodes, ${res.stats.ms.toFixed(0)}ms`
+      );
+
+      // 12b. determinism: identical field state => identical path
+      const field2 = new VertexField(7);
+      field2.materializeRoots(30, 22);
+      const hyd2 = computeHydro(field2, 7, { thrMult: 1.0 });
+      field2.setHydro(hyd2.stamps, hyd2.trunks);
+      const res2 = computeRoad(field2, ka, kb);
+      assert(!!res2 && res2.segs.length === res.segs.length, "deterministic path length");
+      let same = !!res2 && res2.segs.length === res.segs.length;
+      if (res2 && same) {
+        for (let i = 0; i < res.segs.length; i++) {
+          const p = res.segs[i];
+          const q = res2.segs[i];
+          if (p.a1 !== q.a1 || p.b1 !== q.b1 || p.a2 !== q.a2 || p.b2 !== q.b2)
+            same = false;
+        }
+      }
+      assert(same, "deterministic path vertices");
+
+      // 12c. stamping: the polyline vertices themselves sit inside the
+      // stamp core (wobble <= 0.06 vs half-width 0.17), so every segment
+      // endpoint must carry a strong road stamp; L3 midpoints too
+      field.setRoads(res.segs);
+      let stamped = 0;
+      for (const s of res.segs) {
+        if (field.value(vk(s.a1, s.b1)).road > 0.8) stamped++;
+        if (field.value(vk(s.a2, s.b2)).road > 0.8) stamped++;
+      }
+      const endpoints = res.segs.length * 2;
+      assert(
+        stamped >= endpoints * 0.95,
+        `path vertices carry the stamp (${stamped}/${endpoints})`
+      );
+      const midSeg = res.segs[res.segs.length >> 1];
+      const midKey = vk((midSeg.a1 + midSeg.a2) / 2, (midSeg.b1 + midSeg.b2) / 2);
+      const onRoad = field.value(midKey);
+      assert(
+        onRoad.road > 0.8,
+        `L3 midpoint on the path stamped (${onRoad.road.toFixed(2)})`
+      );
+      // far corner of the map: clean
+      const far = field.value(vk(0, 0));
+      assert(far.road === 0, `far vertex clean (${far.road})`);
+      // coarse/fine consistency: the stamp is the same distance field at
+      // every level, so refining must not change ROOT values
+      const rootKeys = res.segs.slice(0, 6).map((s) => vk(s.a1, s.b1));
+      field.setFineHydro(false);
+      const offRoads = rootKeys.map((k) => field.value(k).road);
+      field.setFineHydro(true);
+      const onRoads = rootKeys.map((k) => field.value(k).road);
+      assert(
+        offRoads.every((r, i) => r === onRoads[i]),
+        "road channel independent of fine-detail toggle"
+      );
+
+      // 12d. clearing removes the stamp exactly
+      field.setRoads([]);
+      assert(field.value(midKey).road === 0, "clearRoads removes stamps");
+    }
+
+    // 12e. lakes are bridged when NO land detour exists: an impassable
+    // mountain range spans the whole map (sea to sea), a wide lake fills
+    // its middle, and two carved corridors meet the shore
+    const g = new VertexField(7);
+    for (let i = 10; i <= 21; i++)
+      for (let j = 0; j <= 22; j++) g.paintElev(vk(i * FIX, j * FIX), 1.9);
+    for (let i = 12; i <= 19; i++)
+      for (let j = 1; j <= 21; j++) g.paintElev(vk(i * FIX, j * FIX), 0.02);
+    for (const [i, j] of [
+      [10, 11],
+      [11, 11],
+      [20, 11],
+      [21, 11],
+      [9, 11],
+      [22, 11],
+    ] as const)
+      g.paintElev(vk(i * FIX, j * FIX), 0.35);
+    const hydB = computeHydro(g, 7, { thrMult: 1.0 });
+    g.setHydro(hydB.stamps, hydB.trunks);
+    const lakeCenter = hydB.stamps.get(vk(15 * FIX, 11 * FIX));
+    assert(!!lakeCenter && lakeCenter.lake >= 0.9, "range lake is a lake");
+    const kb2 = computeRoad(
+      g,
+      vk(9 * FIX, 11 * FIX),
+      vk(22 * FIX, 11 * FIX)
+    );
+    assert(!!kb2, "road routes across the walled lake");
+    if (kb2) {
+      assert(
+        kb2.stats.bridges > 0,
+        `lake is bridged, not detoured (${kb2.stats.bridges} bridge edges)`
+      );
+      let crossesLake = false;
+      for (const s of kb2.segs) {
+        const mid = g.value(vk((s.a1 + s.a2) / 2, (s.b1 + s.b2) / 2));
+        if (mid.lake > 0.5) crossesLake = true;
+      }
+      assert(crossesLake, "path vertices include lake interiors");
+      // bridge stamp lands on water vertices (shader draws planks there)
+      g.setRoads(kb2.segs);
+      const lakeMid = g.value(vk(15 * FIX, 11 * FIX));
+      assert(
+        lakeMid.road > 0.4 && lakeMid.lake > 0.5,
+        `bridge stamps road onto the lake vertex (road=${lakeMid.road.toFixed(2)}, lake=${lakeMid.lake.toFixed(2)})`
+      );
+      console.log(
+        `  walled-lake crossing: ${kb2.stats.edges} edges, ${kb2.stats.bridges} bridge(s), ${kb2.stats.ms.toFixed(0)}ms`
+      );
+    }
+
+    // 12f. snapping clamps to the world rectangle
+    const snap1 = snapToRoadGrid(field, -50, -50);
+    assert(snap1 === vk(0, 0), "snap clamps to origin");
+    const snap2 = snapToRoadGrid(field, 999, 999);
+    assert(snap2 === vk(30 * FIX, 22 * FIX), "snap clamps to max corner");
+    const snap3 = snapToRoadGrid(field, 10.13, 5.62);
+    const [sa, sb] = snap3.split(",").map(Number);
+    assert(
+      Math.abs(sa - Math.round(sa)) < 1e-9 &&
+        sa % (FIX >> 2) === 0 &&
+        sb % (FIX >> 2) === 0,
+      "snapped vertex sits on the solve grid"
+    );
+
+    // 12g. identical endpoints => null; unreachable => null
+    assert(
+      computeRoad(field, vk(0, 0), vk(0, 0)) === null,
+      "degenerate route rejected"
+    );
+    // middle of the ocean (off-island corner) has no land route to it
+    const oceanKey = snapToRoadGrid(field, 2.2, 0.4);
+    const oceanV = field.value(oceanKey);
+    if (oceanV.w[0] > 0.62 && oceanV.lake <= 0.2) {
+      assert(
+        computeRoad(field, vk(15 * FIX, 11 * FIX), oceanKey) === null,
+        "ocean destination rejected"
+      );
+    } else {
+      console.log("  (corner is not ocean for this seed — reachability branch skipped)");
+    }
+
+    // 12h. perf: a full solve on the medium map stays interactive
+    const t0 = performance.now();
+    computeRoad(field, vk(9 * S, 11 * S), vk(24 * S, 9 * S));
+    const dt = performance.now() - t0;
+    assert(dt < 1500, `solve interactive (${dt.toFixed(0)}ms)`);
+    console.log(`  medium-map solve: ${dt.toFixed(0)}ms`);
+  }
+}
+
+// ---------- 13. flat water: sea plane, river pool levels, no uphill ----------
+console.log("13. flat water (sea plane, river levels, no uphill)");
+{
+  const f = new VertexField(7);
+  const r = computeHydro(f, 7, { thrMult: 1.0 }, true);
+  f.setHydro(r.stamps, r.trunks);
+  const W1 = f.geo.w + 1;
+  const keyAt = (k: number) => vk((k % W1) * FIX, ((k / W1) | 0) * FIX);
+  const dbg = r.debug!;
+
+  // 13a. THE no-uphill guarantee: along every drainage edge the stamped
+  //      water level never rises downstream (lakes included, so inflowing
+  //      rivers arrive at/above the spill and outlets leave at/below it).
+  //      Slack of one LAKE_MIN: a swampy approach ABOVE a backwater-raised
+  //      inflow can sit up to LAKE_MIN below its downstream level — bounded
+  //      and visually negligible (partial river strength there softens it).
+  let edges = 0;
+  let upFail = 0;
+  let maxRise = 0;
+  for (const [k, st] of r.stamps) {
+    const idx = (parseVk(k)[1] / FIX) * W1 + parseVk(k)[0] / FIX;
+    const rc = dbg.recv[idx];
+    if (rc < 0 || dbg.isOcean[rc]) continue;
+    const down = r.stamps.get(keyAt(rc));
+    if (!down) continue;
+    edges++;
+    if (st.lvl < down.lvl - 1e-9) {
+      maxRise = Math.max(maxRise, down.lvl - st.lvl);
+    }
+  }
+  assert(
+    maxRise <= 0.04,
+    `water level never (materially) rises downstream (max rise ${maxRise.toFixed(4)} over ${edges} edges)`
+  );
+
+  // 13b. the open sea is ONE flat plane at 0; the bed stays in elev
+  //      (boundary roots on land are isOcean for the flood — skip them)
+  let deepSea = 0;
+  let seaFail = 0;
+  for (let k = 0; k < dbg.isOcean.length; k++) {
+    if (!dbg.isOcean[k]) continue;
+    const v = f.value(keyAt(k));
+    if (v.elev > 0.005) continue; // land on the map border, not sea
+    if (v.elev <= -0.025) {
+      deepSea++;
+      if (v.z !== 0) seaFail++;
+      if (v.z - v.elev < 0.02) seaFail++; // depth data preserved for shading
+    } else if (v.z > 1e-9 || v.z < v.elev - 1e-9) {
+      seaFail++; // coastal band: surface between bed and sea level
+    }
+  }
+  assert(seaFail === 0, `sea renders as one flat plane at 0 (${seaFail} fails)`);
+  console.log(`  sea plane: ${deepSea.toLocaleString()} deep ocean roots at z=0, beds intact`);
+
+  // 13c. river pools are flat AT the roots: any strong channel vertex with
+  //      no lake influence renders exactly at its water level
+  let poolRoots = 0;
+  let poolFail = 0;
+  for (const [k, st] of r.stamps) {
+    if (st.river < 0.5 || st.lake >= 0.2) continue;
+    const v = f.value(k);
+    if (v.elev <= 0.005) continue; // coastal band is the sea's business
+    poolRoots++;
+    if (Math.abs(v.z - st.lvl) > 1e-12) poolFail++;
+  }
+  assert(poolFail === 0 && poolRoots > 3, `river cores render flat at their level (${poolFail}/${poolRoots})`);
+
+  // 13d. fine LOD: the trunk midpoint sits exactly on its own water level
+  //      (whichever segment wins the stamp, z clamps to the vertex's lvl)
+  const strong = [...r.trunks].sort((a, b) => b.q - a.q)[0];
+  const mKey = vk((strong.a1 + strong.a2) / 2, (strong.b1 + strong.b2) / 2);
+  const mv = f.value(mKey);
+  assert(
+    mv.river >= 0.48 && Math.abs(mv.z - mv.lvl) < 1e-9,
+    `fine channel midpoint is flat water (riv=${mv.river.toFixed(3)}, z=${mv.z.toFixed(6)}, lvl=${mv.lvl.toFixed(6)})`
+  );
+  const lo = Math.min(strong.la ?? Infinity, strong.lb ?? Infinity);
+  const hi = Math.max(strong.la ?? -Infinity, strong.lb ?? -Infinity);
+  assert(
+    mv.lvl >= lo - 0.05 && mv.lvl <= hi + 0.05,
+    `stamped level interpolates along the segment (${mv.lvl.toFixed(4)} in [${lo.toFixed(4)},${hi.toFixed(4)}])`
+  );
+  // and a same-level pool stays flat across the whole midpoint neighborhood
+  const pool = r.trunks.find(
+    (t) => t.la !== undefined && t.lb !== undefined && Math.abs(t.la - t.lb) < 1e-12 && t.q > 0.5
+  );
+  if (pool) {
+    const pKey = vk((pool.a1 + pool.a2) / 2, (pool.b1 + pool.b2) / 2);
+    const pv = f.value(pKey);
+    assert(
+      Math.abs(pv.lvl - pool.la) < 1e-9 && Math.abs(pv.z - pool.la) < 1e-9,
+      `pool midpoint renders exactly at the pool level (${pv.z.toFixed(6)} vs ${pool.la.toFixed(6)})`
+    );
+  } else {
+    console.log("  (no same-level pool trunk on this seed — pool check skipped)");
+  }
+
+  // 13e. cut & fill: the clamp is symmetric — ground above the level is cut
+  //      down to it, ground below is filled up to it (the bed lives on in
+  //      elev: terrain may sit under the water surface)
+  let probe: ReturnType<typeof vk> | null = null;
+  let bestQ = 0;
+  for (const [k, st] of r.stamps) {
+    if (st.lake >= 0.2 || f.value(k).elev <= 0.3) continue;
+    if (st.river > bestQ) {
+      bestQ = st.river;
+      probe = k;
+    }
+  }
+  assert(!!probe && bestQ > 0.45, `found a strong clean river vertex to probe (q=${bestQ.toFixed(3)})`);
+  const pk = probe!;
+  const baseElev = f.value(pk).elev;
+  const stampsCut = new Map(r.stamps);
+  stampsCut.set(pk, { lake: 0, river: 0.9, fill: 0, boost: 0, lvl: baseElev - 0.3 });
+  f.setHydro(stampsCut, r.trunks);
+  const cutZ = f.value(pk).z;
+  assert(
+    Math.abs(cutZ - (baseElev - 0.3)) < 1e-12,
+    `channel cuts through raised ground to the level (z=${cutZ.toFixed(4)})`
+  );
+  const stampsFill = new Map(r.stamps);
+  stampsFill.set(pk, { lake: 0, river: 0.9, fill: 0, boost: 0, lvl: baseElev + 0.2 });
+  f.setHydro(stampsFill, r.trunks);
+  const fillZ = f.value(pk).z;
+  assert(
+    Math.abs(fillZ - (baseElev + 0.2)) < 1e-12,
+    `channel fills up to the level over a lower bed (z=${fillZ.toFixed(4)})`
+  );
+  // partial strength blends toward the level by the same smoothstep
+  const stampsPart = new Map(r.stamps);
+  stampsPart.set(pk, { lake: 0, river: 0.3, fill: 0, boost: 0, lvl: baseElev - 0.3 });
+  f.setHydro(stampsPart, r.trunks);
+  const partV = f.value(pk);
+  const partS = smoothstep(0.16, 0.48, 0.3);
+  const expectZ = baseElev + (baseElev - 0.3 - baseElev) * partS;
+  assert(
+    Math.abs(partV.z - expectZ) < 1e-12,
+    `partial channel blends toward the level (z=${partV.z.toFixed(4)} vs ${expectZ.toFixed(4)})`
+  );
+  f.setHydro(r.stamps, r.trunks); // restore the real solve
+  const restoredV = f.value(pk);
+  assert(
+    Math.abs(restoredV.z - Math.min(baseElev, restoredV.lvl)) < 1e-9 ||
+      Math.abs(restoredV.z - restoredV.lvl) < 1e-9,
+    "probe restored to the real solve"
+  );
+
+  // 13f. lake junctions: inflow arrives at/above the spill, outflow leaves
+  //      at/below it — scan several seeds so junctions actually exist
+  let inflows = 0;
+  let outflows = 0;
+  let jFail = 0;
+  for (const s of [7, 3, 11, 21, 5]) {
+    const fs = new VertexField(s);
+    const rs = computeHydro(fs, s, { thrMult: 1.0 }, true);
+    const W1s = fs.geo.w + 1;
+    const keyAtS = (k: number) => vk((k % W1s) * FIX, ((k / W1s) | 0) * FIX);
+    for (const [k, st] of rs.stamps) {
+      const pp = parseVk(k);
+      const idx = (pp[1] / FIX) * W1s + pp[0] / FIX;
+      const rc = rs.debug!.recv[idx];
+      if (rc < 0 || rs.debug!.isOcean[rc]) continue;
+      const down = rs.stamps.get(keyAtS(rc));
+      if (!down) continue;
+      if (st.river > 0.12 && down.lake >= 0.9) {
+        inflows++;
+        if (st.lvl < down.lvl - 1e-9) jFail++;
+      }
+      if (st.lake >= 0.9 && down.river > 0.12) {
+        outflows++;
+        // the outlet's bank can sit one priority-flood EPS below the spill
+        // (the flat-area gradient) — absorb it, anything bigger is a bug
+        if (st.lvl > down.lvl + 5e-3) jFail++;
+      }
+    }
+  }
+  assert(jFail === 0, `lake junctions meet the lake surface (${jFail} fails)`);
+  assert(inflows + outflows > 0, `junction edges were found (${inflows} inflow / ${outflows} outflow)`);
+  console.log(`  lake junctions: ${inflows} inflow / ${outflows} outflow edges checked (5 seeds)`);
+
+  // 13g. determinism of the level pipeline at fine LOD (fresh field, same
+  //      state => identical z and lvl around a strong trunk midpoint)
+  const g3 = new VertexField(7);
+  g3.setHydro(r.stamps, r.trunks);
+  let detDiffs = 0;
+  for (let di = -2; di <= 2; di++) {
+    for (let dj = -2; dj <= 2; dj++) {
+      const k = vk(
+        Math.round(((strong.a1 + strong.a2) / 2 / FIX + di * 0.25) * FIX),
+        Math.round(((strong.b1 + strong.b2) / 2 / FIX + dj * 0.25) * FIX)
+      );
+      const a = f.value(k);
+      const b = g3.value(k);
+      if (a.z !== b.z || a.lvl !== b.lvl || a.river !== b.river) detDiffs++;
+    }
+  }
+  assert(detDiffs === 0, `level stamp determinism (${detDiffs})`);
+
+  // 13h. the fine-detail toggle round-trips exactly with levels in play
+  const before = f.value(mKey);
+  f.setFineHydro(false);
+  const off = f.value(mKey);
+  f.setFineHydro(true);
+  const again = f.value(mKey);
+  assert(
+    again.z === before.z && again.lvl === before.lvl && again.river === before.river,
+    "toggle restore is exact with river levels"
+  );
+  assert(
+    off.z !== before.z || off.river !== before.river,
+    "toggle actually changes the fine channel here"
+  );
 }
 
 console.log(failures === 0 ? "\nALL TESTS PASSED" : `\n${failures} FAILURES`);

@@ -18,16 +18,19 @@
  *     they ride on top of whatever the weights classify (they visibly run
  *     into the sea and out of lakes).
  *   - rendered surface elevation (vP.w) differs from terrain elevation
- *     (vP.z) over lakes: water surfaces render FLAT at the spill level and
- *     depth shading reads the true (stamped) depth below.
+ *     (vP.z) over water — the FLAT-WATER contract: the open sea renders as
+ *     one plane at sea level, lakes at their spill level, rivers at their
+ *     pool-and-drop level (monotone downstream — water never climbs). The
+ *     bed below the surface stays in vP.z; depth shading reads vP.w - vP.z.
  *
  * Shading: screen-space derivative normals (flat-shaded 2.5D relief).
  * uMode: 0 = mesh triangles, 1 = vertex dots (round), 2 = wireframe lines.
  *
- * Vertex layout (STRIDE 12 floats):
+ * Vertex layout (STRIDE 16 floats):
  *   loc0 vec4 aPos = (x, y, elev, z)      world units, level-0 space
  *   loc1 vec4 aM   = (water, sand, grass, forest)
  *   loc2 vec4 aN   = (rock, snow, moist, river)
+ *   loc3 vec4 aR   = (road, 0, 0, 0)
  */
 
 export const VERT_SRC = `#version 300 es
@@ -36,6 +39,7 @@ precision highp float;
 in vec4 aPos;   // x, y, elev(terrain), z(render surface)
 in vec4 aM;     // water, sand, grass, forest
 in vec4 aN;     // rock, snow, moist, river
+in vec4 aR;     // road
 
 uniform vec2 uResolution; // device pixels
 uniform float uZoom;
@@ -46,6 +50,7 @@ uniform float uPointSize;
 out vec4 vP;
 out vec4 vM;
 out vec4 vN;
+out vec4 vR;
 
 void main() {
   vec2 iso = vec2(aPos.x - aPos.y, (aPos.x + aPos.y) * 0.5 - aPos.w * uES);
@@ -56,6 +61,7 @@ void main() {
   vP = aPos;
   vM = aM;
   vN = aN;
+  vR = aR;
 }
 `;
 
@@ -65,11 +71,13 @@ precision highp float;
 in vec4 vP;   // x, y, elev, z
 in vec4 vM;   // water, sand, grass, forest
 in vec4 vN;   // rock, snow, moist, river
+in vec4 vR;   // road
 
 uniform float uTime;
 uniform int uMode;
 uniform vec3 uFlatColor;
 uniform float uRiverOn;
+uniform float uRoadOn;
 
 out vec4 frag;
 
@@ -95,6 +103,17 @@ void main() {
     frag = vec4(uFlatColor, 1.0);
     return;
   }
+  if (uMode == 3) {
+    // road overlay quad (uRoadOn handled by the draw call): flat dirt or
+    // plank-over-water color with grain. vM.x carries the endpoint water
+    // weight so lake crossings render as bridges at every LOD.
+    float grain = vnoise(vP.xy * 42.0);
+    vec3 rc = (vM.x > 0.6)
+      ? mix(vec3(0.36, 0.26, 0.15), vec3(0.47, 0.36, 0.21), grain)
+      : mix(vec3(0.46, 0.37, 0.24), vec3(0.56, 0.47, 0.32), grain);
+    frag = vec4(rc * (0.86 + 0.2 * grain), 1.0);
+    return;
+  }
   if (uMode == 1) {
     vec2 c = gl_PointCoord - 0.5;
     if (dot(c, c) > 0.25) discard;
@@ -114,8 +133,9 @@ void main() {
   vec3 col;
 
   if (water > 0.60) {
-    // open water: sea reads depth off the terrain; lakes off the surface.
-    // max() unifies both: ocean has z==elev, lakes have z>elev.
+    // open water: depth = surface - bed (vP.z) — works for the sea (the
+    // surface is the sea-level plane), lakes (spill level) and rivers
+    // (pool level); the bed stays in vP.z under all of them.
     float depth = clamp(max(-vP.z, vP.w - vP.z) * 1.9 + (water - 0.60) * 0.9, 0.0, 1.0);
     vec3 shallow = vec3(0.26, 0.58, 0.62);
     vec3 deep = vec3(0.045, 0.19, 0.33);
@@ -146,13 +166,33 @@ void main() {
     // muddy banks before the water itself
     float bank = smoothstep(0.035, 0.14, riv);
     col = mix(col, vec3(0.40, 0.33, 0.23), bank * 0.7);
-    // the channel: jittered edge keeps it organic
+    // the channel: jittered edge keeps it organic. The blue end is kept
+    // clearly bluer than the forest palette so channels read on any ground.
     float core = smoothstep(0.22, 0.55, riv + (n1 - 0.5) * 0.14);
-    vec3 rcol = mix(vec3(0.30, 0.50, 0.52), vec3(0.07, 0.21, 0.29),
+    vec3 rcol = mix(vec3(0.34, 0.58, 0.62), vec3(0.10, 0.32, 0.47),
                     smoothstep(0.30, 0.90, riv));
     float flow = vnoise(vP.xy * 22.0 + vec2(uTime * 0.9, -uTime * 0.6));
-    rcol += vec3(0.10) * smoothstep(0.74, 0.95, flow) * core;
+    rcol += vec3(0.11) * smoothstep(0.74, 0.95, flow) * core;
     col = mix(col, rcol, core);
+  }
+
+  // ---- road overlay (authored infrastructure, rides over everything) ----
+  // On land: a worn dirt track. Over open water: a plank bridge, so roads
+  // that cross lakes stay readable. Drawn AFTER rivers (a road fords or
+  // bridges a river on top of it).
+  if (uRoadOn > 0.5 && vR.x > 0.015) {
+    float rd = vR.x + (n2 - 0.5) * 0.12;
+    float core = smoothstep(0.30, 0.62, rd);
+    float shoulder = smoothstep(0.10, 0.30, rd);
+    if (core > 0.002) {
+      float grain = vnoise(vP.xy * 42.0);
+      vec3 rcol = (water > 0.60)
+        ? mix(vec3(0.36, 0.26, 0.15), vec3(0.47, 0.36, 0.21), grain)  // planks
+        : mix(vec3(0.46, 0.37, 0.24), vec3(0.56, 0.47, 0.32), grain); // dirt
+      col = mix(col, rcol * (0.82 + 0.30 * core), core);
+    }
+    // dark trampled rim where the path meets the ground
+    col = mix(col, vec3(0.30, 0.24, 0.16), shoulder * (1.0 - core) * 0.35);
   }
 
   // flat-shaded relief from screen-space derivatives (land only)
