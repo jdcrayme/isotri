@@ -4,7 +4,8 @@
  * vertex field; finer layers only ever inherit the stamp by interpolation,
  * so they never need to re-run the global solve).
  *
- * Pipeline (all O(V log V), V = (w+1)*(h+1) root vertices):
+ * Pipeline (all O(V log V), V = (w+1)*(h+1) root vertices for the field's
+ * world size):
  *
  *  1. Rain field — deterministic fBm + orographic boost over high ground.
  *  2. Priority-flood depression filling (Barnes et al. 2014): start from the
@@ -26,7 +27,7 @@
 
 import { clamp, fbm, smoothstep } from "./hash";
 import { FIX, vk, worldXY, type VertexKey } from "./lattice";
-import { GEO, VertexField, type HydroStamp } from "./field";
+import { VertexField, type HydroStamp } from "./field";
 
 export interface HydroParams {
   /** River threshold multiplier — higher => fewer, bigger rivers. */
@@ -165,8 +166,9 @@ export function computeHydro(
   withDebug = false
 ): HydroResult {
   const t0 = performance.now();
-  const w = GEO.w;
-  const h = GEO.h;
+  // world size comes from the field's geometry (selectable in the editor)
+  const w = field.geo.w;
+  const h = field.geo.h;
   const W1 = w + 1;
   const N = W1 * (h + 1);
   const nb = buildNeighbors(w, h);

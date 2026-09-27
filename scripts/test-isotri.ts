@@ -18,9 +18,15 @@ import {
   worldXY,
 } from "../src/lib/isotri/lattice";
 import { TriMesh } from "../src/lib/isotri/mesh";
-import { VertexField, GEO } from "../src/lib/isotri/field";
+import {
+  VertexField,
+  GEO,
+  MAP_SIZES,
+  clampMapSize,
+  makeGeometry,
+  sizeKeyFor,
+} from "../src/lib/isotri/field";
 import { computeHydro } from "../src/lib/isotri/hydro";
-import { FIX } from "../src/lib/isotri/lattice";
 
 let failures = 0;
 function assert(cond: boolean, msg: string) {
@@ -403,6 +409,87 @@ console.log("8. terrain edit -> hydrology response");
   console.log(
     `  bowl: lake=${bs.lake.toFixed(2)} fill=${bs.fill.toFixed(3)} depth=${(bs.fill - 0.1).toFixed(3)}`
   );
+}
+
+// ---------- 9. map sizes: parameterized world geometry ----------
+console.log("9. map sizes");
+{
+  // default geometry is untouched: seed-7 worlds stay byte-identical
+  assert(GEO.w === 30 && GEO.h === 22 && GEO.r === 8.6, "default geo constants");
+  const mg = makeGeometry(30, 22);
+  assert(
+    mg.cx === GEO.cx &&
+      Math.abs(mg.cy - GEO.cy) < 1e-12 &&
+      mg.r === GEO.r,
+    "makeGeometry(30,22) reproduces the default"
+  );
+  assert(sizeKeyFor(30, 22) === "medium", "size key round-trip");
+  assert(sizeKeyFor(31, 22) === null, "unknown size has no preset");
+  const cs = clampMapSize(4, 999);
+  assert(cs.w === 8 && cs.h === 128, "size clamping");
+
+  // island radius scales with the smaller iso extent, landmass stays sane
+  for (const s of MAP_SIZES) {
+    const g = makeGeometry(s.w, s.h);
+    const f = new VertexField(7, g);
+    let land = 0;
+    let n = 0;
+    for (let j = 0; j <= s.h; j++) {
+      for (let i = 0; i <= s.w; i++) {
+        const v = f.value(vk(i * FIX, j * FIX));
+        if (v.elev > 0.02) land++;
+        n++;
+      }
+    }
+    const frac = land / n;
+    assert(
+      frac > 0.2 && frac < 0.75,
+      `${s.label} (${s.w}x${s.h}) land fraction ${(frac * 100).toFixed(0)}%`
+    );
+  }
+
+  // hydrology is deterministic at a non-default size
+  const small = new VertexField(7, makeGeometry(22, 16));
+  const s1 = computeHydro(small, 7, { thrMult: 1.0 }, true);
+  const s2 = computeHydro(small, 7, { thrMult: 1.0 }, true);
+  let detFail = 0;
+  for (const [k, st] of s1.stamps) {
+    const t = s2.stamps.get(k)!;
+    if (st.river !== t.river || st.lake !== t.lake || st.fill !== t.fill)
+      detFail++;
+  }
+  assert(detFail === 0, `small-map hydro determinism (${detFail})`);
+
+  // big worlds: more rivers (the threshold is a land quantile, so the
+  // network scales with the map), and the solve stays interactive
+  const big = new VertexField(7, makeGeometry(64, 46));
+  const t0 = performance.now();
+  const b1 = computeHydro(big, 7, { thrMult: 1.0 });
+  const bigMs = performance.now() - t0;
+  assert(b1.stats.rivers > s1.stats.rivers, "bigger world, more rivers");
+  assert(bigMs < 2000, `huge-map hydro solve interactive (${bigMs.toFixed(1)}ms)`);
+  console.log(
+    `  huge (64x46, ${(65 * 47).toLocaleString()} verts): rivers=${b1.stats.rivers} lakes=${b1.stats.lakes} in ${bigMs.toFixed(1)}ms`
+  );
+
+  // drainage invariants hold at size too: no cycles, nothing stranded
+  const dbg = s1.debug!;
+  const SN = 23 * 17;
+  let cycle = 0;
+  for (let k = 0; k < SN; k++) {
+    if (dbg.isOcean[k]) continue;
+    const seen = new Set<number>();
+    let cur = k;
+    for (; cur >= 0 && !dbg.isOcean[cur]; ) {
+      if (seen.has(cur)) {
+        cycle++;
+        break;
+      }
+      seen.add(cur);
+      cur = dbg.recv[cur];
+    }
+  }
+  assert(cycle === 0, `small-map drainage has no cycles (${cycle})`);
 }
 
 console.log(failures === 0 ? "\nALL TESTS PASSED" : `\n${failures} FAILURES`);

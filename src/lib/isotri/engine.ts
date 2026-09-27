@@ -26,9 +26,14 @@ import {
 } from "./lattice";
 import {
   GEO,
+  MAP_SIZES,
   VertexField,
   MATERIALS,
   K,
+  clampMapSize,
+  makeGeometry,
+  sizeKeyFor,
+  type MapGeometry,
   type Override,
   type VV,
 } from "./field";
@@ -52,6 +57,8 @@ export interface Stats {
   lakes: number;
   swamps: number;
   hydroMs: number;
+  mapW: number;
+  mapH: number;
 }
 
 export interface HoverCorner {
@@ -119,8 +126,11 @@ export class IsoTriEngine {
   private container: HTMLElement;
 
   mesh = new TriMesh();
-  field: VertexField;
+  /** Assigned in the constructor via resetWorld()/tryLoad(). */
+  field!: VertexField;
   seed = 7;
+  /** World geometry — part of the document, selectable in the editor. */
+  private geo: MapGeometry = GEO;
 
   tool: Tool = "paint";
   material = 2; // grass
@@ -240,13 +250,19 @@ export class IsoTriEngine {
 
   // ---------------- world setup ----------------
 
-  resetWorld(seed: number): void {
+  /**
+   * Regenerate the world. `size` (in root cells) changes the map dimensions;
+   * omitting it keeps the current size. Terrain is a pure function of
+   * (seed, geometry), so the same seed + size always yields the same world.
+   */
+  resetWorld(seed: number, size?: { w: number; h: number }): void {
     this.seed = seed | 0;
+    if (size) this.geo = makeGeometry(size.w, size.h);
     this.mesh = new TriMesh();
-    for (let j = 0; j < GEO.h; j++)
-      for (let i = 0; i < GEO.w; i++) this.mesh.addRootCell(i, j);
-    this.field = new VertexField(this.seed);
-    this.field.materializeRoots(GEO.w, GEO.h);
+    for (let j = 0; j < this.geo.h; j++)
+      for (let i = 0; i < this.geo.w; i++) this.mesh.addRootCell(i, j);
+    this.field = new VertexField(this.seed, this.geo);
+    this.field.materializeRoots(this.geo.w, this.geo.h);
     this.undoStack = [];
     this.redoStack = [];
     this.runHydro();
@@ -254,6 +270,21 @@ export class IsoTriEngine {
     this.fitCamera();
     this.emitStats();
     this.scheduleSave();
+  }
+
+  /** Change the world size (root cells). Regenerates; keeps the seed. */
+  setMapSize(w: number, h: number): void {
+    const s = clampMapSize(w, h);
+    this.resetWorld(this.seed, s);
+  }
+
+  /** Current world size + which editor preset it matches (null = custom). */
+  get mapSize(): { w: number; h: number; key: string | null } {
+    return {
+      w: this.geo.w,
+      h: this.geo.h,
+      key: sizeKeyFor(this.geo.w, this.geo.h),
+    };
   }
 
   // ---------------- hydrology ----------------
@@ -306,6 +337,7 @@ export class IsoTriEngine {
       v: 1,
       seed: this.seed,
       thrMult: this.thrMult,
+      geo: { w: this.geo.w, h: this.geo.h },
       ov,
       subdiv: subdiv.map((s) => s.k),
     });
@@ -314,6 +346,7 @@ export class IsoTriEngine {
   private static parseDoc(json: string): {
     seed: number;
     thrMult: number;
+    geo: { w: number; h: number };
     ov: [VertexKey, Override][];
     subdiv: TriKey[];
   } | null {
@@ -322,10 +355,16 @@ export class IsoTriEngine {
         v?: number;
         seed?: number;
         thrMult?: number;
+        geo?: { w?: number; h?: number };
         ov?: [string, { e?: number; m?: number; w?: number[] }][];
         subdiv?: string[];
       };
       if (!d || d.v !== 1 || typeof d.seed !== "number") return null;
+      // worlds saved before size selection have no geo field: 30×22 default
+      const geo =
+        d.geo && typeof d.geo.w === "number" && typeof d.geo.h === "number"
+          ? clampMapSize(d.geo.w, d.geo.h)
+          : { w: GEO.w, h: GEO.h };
       const ov: [VertexKey, Override][] = [];
       for (const [key, o] of d.ov ?? []) {
         if (!/^-?\d+,-?\d+$/.test(key)) return null;
@@ -351,6 +390,7 @@ export class IsoTriEngine {
       return {
         seed: Math.floor(d.seed),
         thrMult: typeof d.thrMult === "number" ? d.thrMult : 1,
+        geo,
         ov,
         subdiv,
       };
@@ -367,11 +407,12 @@ export class IsoTriEngine {
     if (!doc) return false;
     this.seed = doc.seed;
     this.thrMult = doc.thrMult;
+    this.geo = makeGeometry(doc.geo.w, doc.geo.h);
     this.mesh = new TriMesh();
-    for (let j = 0; j < GEO.h; j++)
-      for (let i = 0; i < GEO.w; i++) this.mesh.addRootCell(i, j);
-    this.field = new VertexField(this.seed);
-    this.field.materializeRoots(GEO.w, GEO.h);
+    for (let j = 0; j < this.geo.h; j++)
+      for (let i = 0; i < this.geo.w; i++) this.mesh.addRootCell(i, j);
+    this.field = new VertexField(this.seed, this.geo);
+    this.field.materializeRoots(this.geo.w, this.geo.h);
     for (const [key, o] of doc.ov) this.field.overrides.set(key, o);
     for (const k of doc.subdiv) {
       const t = this.mesh.get(k);
@@ -420,12 +461,13 @@ export class IsoTriEngine {
   // ---------------- camera ----------------
 
   private fitCamera(): void {
+    const g = this.field ? this.field.geo : GEO;
     const [cw, ch] = this.cssSize();
     // iso extents of the map rectangle (z = 0) plus elevation headroom
-    const ixMin = -(GEO.h * Math.sqrt(3) / 2 - 0) - 1;
-    const ixMax = GEO.w + 1;
+    const ixMin = -(g.h * Math.sqrt(3) / 2 - 0) - 1;
+    const ixMax = g.w + 1;
     const iyMin = -2.2; // headroom for peaks
-    const iyMax = (GEO.w + GEO.h * 0.5) / 2 + 1;
+    const iyMax = (g.w + g.h * 0.5) / 2 + 1;
     const spanX = ixMax - ixMin;
     const spanY = iyMax - iyMin;
     this.zoom = Math.min(cw / spanX, ch / spanY) * 0.97;
@@ -653,6 +695,8 @@ export class IsoTriEngine {
       lakes: this.lastHydro?.lakes ?? 0,
       swamps: this.lastHydro?.swamps ?? 0,
       hydroMs: this.lastHydro?.ms ?? 0,
+      mapW: this.geo.w,
+      mapH: this.geo.h,
     });
   }
 
@@ -1012,5 +1056,5 @@ export class IsoTriEngine {
 }
 
 // re-export for UI convenience
-export { MATERIALS, GEO, MAX_LEVEL, FIX };
-export type { VV, Override };
+export { MATERIALS, GEO, MAP_SIZES, MAX_LEVEL, FIX, sizeKeyFor };
+export type { VV, Override, MapGeometry };

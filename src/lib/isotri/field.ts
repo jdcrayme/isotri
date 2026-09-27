@@ -30,6 +30,7 @@
 import { clamp, fbm, hashNoise, smoothstep, hash3 } from "./hash";
 import {
   FIX,
+  SQRT3_2,
   vertexLevel,
   vertexParents,
   parseVk,
@@ -79,6 +80,23 @@ export interface MapGeometry {
   r: number; // island radius (world units)
 }
 
+/**
+ * Build a consistent geometry for a w×h root lattice.
+ *
+ * World extents of a w×h grid: x ∈ [0, w + h/2], y ∈ [0, h·√3/2]. The island
+ * radius scales with the smaller extent so the landmass fills the rectangle
+ * the same way at every size (at the default 30×22 this is exactly the
+ * original hand-tuned r = 8.6, so seed-7 worlds are unchanged).
+ */
+export function makeGeometry(w: number, h: number): MapGeometry {
+  const cx = (w + h * 0.5) / 2;
+  const cy = (h * Math.sqrt(3)) / 4;
+  const r =
+    (8.6 * Math.min(w + h * 0.5, h * SQRT3_2)) / (22 * SQRT3_2);
+  return { w, h, cx, cy, r };
+}
+
+/** Default world (kept as a literal so existing saved worlds stay exact). */
 export const GEO: MapGeometry = {
   w: 30,
   h: 22,
@@ -86,9 +104,40 @@ export const GEO: MapGeometry = {
   cy: 0,
   r: 8.6,
 };
-// world x range: [0, w + h/2], y range: [0, h*sqrt(3)/2]
 GEO.cx = (GEO.w + GEO.h * 0.5) / 2;
 GEO.cy = (GEO.h * Math.sqrt(3)) / 4;
+
+/** Named world sizes offered by the editor. Medium is the classic default. */
+export interface MapSizePreset {
+  key: string;
+  label: string;
+  w: number;
+  h: number;
+}
+
+export const MAP_SIZES: MapSizePreset[] = [
+  { key: "small", label: "Small", w: 22, h: 16 },
+  { key: "medium", label: "Medium", w: 30, h: 22 },
+  { key: "large", label: "Large", w: 44, h: 32 },
+  { key: "huge", label: "Huge", w: 64, h: 46 },
+];
+
+/** Which preset (if any) a saved w×h corresponds to. */
+export function sizeKeyFor(w: number, h: number): string | null {
+  for (const s of MAP_SIZES) if (s.w === w && s.h === h) return s.key;
+  return null;
+}
+
+/** Sanity bounds for a geometry coming off disk. */
+export const MAP_SIZE_MIN = 8;
+export const MAP_SIZE_MAX = 128;
+
+export function clampMapSize(w: number, h: number): { w: number; h: number } {
+  return {
+    w: Math.round(Math.max(MAP_SIZE_MIN, Math.min(MAP_SIZE_MAX, w))),
+    h: Math.round(Math.max(MAP_SIZE_MIN, Math.min(MAP_SIZE_MAX, h))),
+  };
+}
 
 /** Classify (elevation, moisture) into the base palette weight vector. */
 export function classify(elev: number, moist: number): Float32Array {
@@ -132,12 +181,13 @@ export function classify(elev: number, moist: number): Float32Array {
 export function seedTerrain(
   a: number,
   b: number,
-  seed: number
+  seed: number,
+  geo: MapGeometry = GEO
 ): { elev: number; moist: number } {
   const [wx, wy] = worldXY(a, b);
-  const dx = wx - GEO.cx;
-  const dy = wy - GEO.cy;
-  const d = Math.sqrt(dx * dx + dy * dy) / GEO.r;
+  const dx = wx - geo.cx;
+  const dy = wy - geo.cy;
+  const d = Math.sqrt(dx * dx + dy * dy) / geo.r;
 
   // base: rises from the coast, falls toward the interior; exponent shapes
   // the coastal shelf.
@@ -176,6 +226,8 @@ function ampWeight(L: number): number {
 
 export class VertexField {
   seed: number;
+  /** World geometry (size/center/island radius) — part of the document. */
+  geo: MapGeometry;
   /** User-painted vertices (partial) — the only authoritative mutable state. */
   overrides = new Map<VertexKey, Override>();
   /**
@@ -188,8 +240,9 @@ export class VertexField {
   /** Vertices that exist (level-0 grid + every created midpoint). */
   materialized = new Set<VertexKey>();
 
-  constructor(seed: number) {
+  constructor(seed: number, geo: MapGeometry = GEO) {
     this.seed = seed | 0;
+    this.geo = geo;
   }
 
   ensure(a: number, b: number): VertexKey {
@@ -228,7 +281,7 @@ export class VertexField {
     let w: Float32Array | null = null;
 
     if (L === 0) {
-      const sv = seedTerrain(a, b, this.seed);
+      const sv = seedTerrain(a, b, this.seed, this.geo);
       elev = sv.elev;
       moist = sv.moist;
       z = elev;

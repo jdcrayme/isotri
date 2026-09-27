@@ -17,7 +17,7 @@ import {
   type Stats,
   type Tool,
 } from "@/lib/isotri/engine";
-import { MATERIALS } from "@/lib/isotri/field";
+import { MATERIALS, MAP_SIZES } from "@/lib/isotri/field";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -116,11 +116,15 @@ export default function IsoTriEditor() {
     lakes: 0,
     swamps: 0,
     hydroMs: 0,
+    mapW: 30,
+    mapH: 22,
   });
   const [hover, setHover] = useState<HoverInfo | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [glError, setGlError] = useState<string | null>(null);
   const [resetConfirm, setResetConfirm] = useState(false);
+  const [sizeArm, setSizeArm] = useState<string | null>(null);
+  const sizeArmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // mount the engine once
   useEffect(() => {
@@ -196,6 +200,22 @@ export default function IsoTriEditor() {
     engineRef.current?.reset();
   };
 
+  // Map size: two-click confirm, since resizing regenerates the world
+  // (same seed, but painted edits and subdivision are lost).
+  const doSetSize = (w: number, h: number, key: string) => {
+    if (sizeArm !== key) {
+      setSizeArm(key);
+      if (sizeArmTimer.current) clearTimeout(sizeArmTimer.current);
+      sizeArmTimer.current = setTimeout(() => setSizeArm(null), 2600);
+      return;
+    }
+    setSizeArm(null);
+    engineRef.current?.setMapSize(w, h);
+  };
+
+  const curSize =
+    MAP_SIZES.find((s) => s.w === stats.mapW && s.h === stats.mapH) ?? null;
+
   const activeTool = TOOLS.find((t) => t.id === tool)!;
 
   const fmtPct = (x: number) => Math.round(x * 100) + "%";
@@ -224,6 +244,13 @@ export default function IsoTriEditor() {
           </Badge>
           <Badge variant="secondary" className="hidden font-mono text-[11px] sm:inline-flex">
             {stats.rivers} river · {stats.lakes} lake · {stats.swamps} wet
+          </Badge>
+          <Badge
+            variant="outline"
+            className="hidden font-mono text-[10px] text-zinc-500 lg:inline-flex"
+            title="world size in root cells"
+          >
+            {stats.mapW}×{stats.mapH}
           </Badge>
           <Badge
             variant="outline"
@@ -373,6 +400,39 @@ export default function IsoTriEditor() {
                 {brush.toFixed(1)}
               </span>
             </div>
+          </section>
+
+          <section className="w-40 shrink-0 space-y-2 md:w-auto">
+            <h2 className="text-[11px] font-medium uppercase tracking-wider text-zinc-500">
+              Map size
+            </h2>
+            <div className="grid w-40 grid-cols-2 gap-1 md:w-auto">
+              {MAP_SIZES.map((s) => {
+                const active = curSize?.key === s.key;
+                const armed = sizeArm === s.key;
+                return (
+                  <Button
+                    key={s.key}
+                    variant={armed ? "destructive" : active ? "secondary" : "outline"}
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    title={
+                      active
+                        ? `${s.label} is the current size — click twice to regenerate`
+                        : `Resize the world to ${s.w}×${s.h} (regenerates, keeps the seed)`
+                    }
+                    onClick={() => doSetSize(s.w, s.h, s.key)}
+                  >
+                    {armed ? "Sure?" : s.label}
+                  </Button>
+                );
+              })}
+            </div>
+            <p className="text-[10px] leading-snug text-zinc-500">
+              {stats.mapW}×{stats.mapH} · {((stats.mapW + 1) * (stats.mapH + 1)).toLocaleString()} hydro vertices.
+              Resizing regenerates the world at the same seed; painted edits
+              are cleared.
+            </p>
           </section>
 
           <section className="w-40 shrink-0 space-y-2 md:w-auto">
