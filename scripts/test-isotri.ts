@@ -492,5 +492,163 @@ console.log("9. map sizes");
   assert(cycle === 0, `small-map drainage has no cycles (${cycle})`);
 }
 
+// ---------- 10. fine-layer hydrology inheritance ----------
+console.log("10. fine-layer hydrology: trunk seeding + lake clamping");
+{
+  const f = new VertexField(7);
+  const r = computeHydro(f, 7, { thrMult: 1.0 });
+  assert(r.trunks.length > 0, `trunk segments emitted (${r.trunks.length})`);
+  f.setHydro(r.stamps, r.trunks);
+
+  // trunk data sanity: root-lattice endpoints, strength in (0, 1]
+  let badTrunks = 0;
+  for (const t of r.trunks) {
+    if (
+      t.a1 % FIX !== 0 || t.b1 % FIX !== 0 ||
+      t.a2 % FIX !== 0 || t.b2 % FIX !== 0 ||
+      !(t.q > 0 && t.q <= 1)
+    )
+      badTrunks++;
+  }
+  assert(badTrunks === 0, `trunk segment data sane (${badTrunks})`);
+  console.log(`  ${r.trunks.length} trunk segments emitted`);
+
+  // 10a. coarse views are byte-exact with and without the trunk index
+  const f2 = new VertexField(7);
+  f2.setHydro(r.stamps); // stamps only — no trunks, pure interpolation
+  let coarseDiffs = 0;
+  for (const k of r.stamps.keys()) {
+    const a = f.value(k);
+    const b = f2.value(k);
+    if (
+      a.river !== b.river || a.z !== b.z || a.lake !== b.lake ||
+      a.fill !== b.fill || a.elev !== b.elev
+    )
+      coarseDiffs++;
+  }
+  assert(
+    coarseDiffs === 0,
+    `trunk seeding leaves coarse values exact (${coarseDiffs})`
+  );
+
+  // 10b. a strong trunk keeps its coarse strength on the fine centerline
+  //      (interpolation-only dilutes the channel core as levels refine)
+  const strong = [...r.trunks].sort((a, b) => b.q - a.q)[0];
+  const Q = strong.q;
+  const [ax, ay] = worldXY(strong.a1, strong.b1);
+  const [bx, by] = worldXY(strong.a2, strong.b2);
+  const segLen = Math.hypot(bx - ax, by - ay) || 1;
+  const px = -(by - ay) / segLen; // unit perpendicular
+  const py = (bx - ax) / segLen;
+  const mKey = vk((strong.a1 + strong.a2) / 2, (strong.b1 + strong.b2) / 2);
+  const [mx, my] = worldXY((strong.a1 + strong.a2) / 2, (strong.b1 + strong.b2) / 2);
+  const snap2 = (x: number, y: number) => {
+    const [aF, bF] = worldToLattice(x, y);
+    return vk(Math.round(aF * 4) * (FIX / 4), Math.round(bF * 4) * (FIX / 4));
+  };
+  let onCore = 0;
+  for (let t = -0.18; t <= 0.18; t += 0.06) {
+    onCore = Math.max(onCore, f.value(snap2(mx + px * t, my + py * t)).river);
+  }
+  assert(
+    onCore >= 0.85 * Q,
+    `fine channel core stays crisp (on=${onCore.toFixed(3)} vs q=${Q.toFixed(3)})`
+  );
+  const midOn = f.value(mKey).river;
+  assert(
+    midOn >= 0.95 * Q,
+    `trunk midpoint carries full strength (on=${midOn.toFixed(3)})`
+  );
+  console.log(
+    `  strongest trunk q=${Q.toFixed(3)}: fine core=${onCore.toFixed(3)} (interp-only would dilute to ≤${(0.75 * Q).toFixed(3)})`
+  );
+
+  // 10c. two-cell walled bowl -> lake; fine vertices between two wet roots
+  //      render EXACTLY at the water level, shore vertices move toward it
+  const g = new VertexField(7);
+  const wet: [number, number][] = [
+    [15, 11],
+    [16, 11],
+  ];
+  const wall: [number, number][] = [
+    [14, 11], [15, 10], [15, 12], [16, 10], [14, 12],
+    [17, 11], [16, 12], [17, 10],
+  ];
+  for (const [i, j] of wet)
+    g.paintElev(vk(i * FIX, j * FIX), 0.1);
+  for (const [i, j] of wall)
+    g.paintElev(vk(i * FIX, j * FIX), 0.85);
+  const bowl = computeHydro(g, 7, { thrMult: 1.0 });
+  g.setHydro(bowl.stamps, bowl.trunks);
+  const wetKeys = wet.map(([i, j]) => vk(i * FIX, j * FIX));
+  const wetStamps = wetKeys.map((k) => bowl.stamps.get(k)!);
+  assert(
+    wetStamps.every((s) => s.lake >= 0.9),
+    `two-cell bowl is a lake (${wetStamps.map((s) => s.lake.toFixed(2)).join(",")})`
+  );
+  // the two wet roots sit at slightly different priority-flood levels (EPS
+  // stacking across the flat bottom), so the local water level a fine vertex
+  // inherits is the MEAN of its parents' fills — that is what z must match
+  const wetWet = vk(
+    ((15 + 16) / 2) * FIX,
+    11 * FIX
+  );
+  const vw = g.value(wetWet);
+  const expectedLvl = vw.fill; // the vertex's own inherited water level
+  assert(
+    Math.abs(expectedLvl - (wetStamps[0].fill + wetStamps[1].fill) / 2) < 1e-12,
+    "water level inherits as the mean of the parents' fills"
+  );
+  assert(
+    vw.lake >= 0.9 && Math.abs(vw.z - expectedLvl) < 1e-9,
+    `fine water surface clamps exactly to the water level (z=${vw.z.toFixed(6)}, lvl=${expectedLvl.toFixed(6)})`
+  );
+  assert(vw.w[0] > 0.95, `fine lake interior is water (w=${vw.w[0].toFixed(3)})`);
+
+  // shoreline: wet/dry midpoint is pulled toward the water level, never away
+  const shoreKey = vk(15 * FIX, ((11 + 10) / 2) * FIX);
+  const shoreOn = g.value(shoreKey);
+  g.setFineHydro(false);
+  const shoreOff = g.value(shoreKey);
+  g.setFineHydro(true);
+  assert(
+    Math.abs(shoreOn.z - shoreOn.fill) <=
+      Math.abs(shoreOff.z - shoreOn.fill) + 1e-9,
+    `lake clamping pulls shore vertices toward the water level (on=${Math.abs(shoreOn.z - shoreOn.fill).toFixed(4)}, off=${Math.abs(shoreOff.z - shoreOn.fill).toFixed(4)})`
+  );
+
+  // 10d. the fine-detail toggle round-trips through the cache
+  const toggled = g.value(wetWet);
+  g.setFineHydro(false);
+  const offWet = g.value(wetWet);
+  g.setFineHydro(true);
+  const onAgain = g.value(wetWet);
+  assert(
+    onAgain.z === toggled.z && onAgain.river === toggled.river,
+    "toggle restore is exact"
+  );
+  assert(
+    Math.abs(offWet.z - offWet.fill) < 1e-9,
+    "interp-only path is still flat here (both parents flattened)"
+  );
+
+  // 10e. determinism: fresh field + same stamps/trunks => same fine values
+  const g3 = new VertexField(7);
+  g3.setHydro(bowl.stamps, bowl.trunks);
+  let detDiffs = 0;
+  for (let di = -3; di <= 3; di++) {
+    for (let dj = -3; dj <= 3; dj++) {
+      const k = vk(
+        Math.round((15.5 + di * 0.25) * FIX),
+        Math.round((11 + dj * 0.25) * FIX)
+      );
+      const a = g.value(k);
+      const b = g3.value(k);
+      if (a.river !== b.river || a.z !== b.z) detDiffs++;
+    }
+  }
+  assert(detDiffs === 0, `fine values deterministic across fields (${detDiffs})`);
+}
+
 console.log(failures === 0 ? "\nALL TESTS PASSED" : `\n${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);

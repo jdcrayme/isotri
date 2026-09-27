@@ -27,7 +27,7 @@
 
 import { clamp, fbm, smoothstep } from "./hash";
 import { FIX, vk, worldXY, type VertexKey } from "./lattice";
-import { VertexField, type HydroStamp } from "./field";
+import { VertexField, type HydroStamp, type TrunkSeg } from "./field";
 
 export interface HydroParams {
   /** River threshold multiplier — higher => fewer, bigger rivers. */
@@ -38,6 +38,7 @@ export interface HydroStats {
   rivers: number;
   lakes: number;
   swamps: number;
+  trunks: number;
   ms: number;
   thr: number;
   vertices: number;
@@ -53,6 +54,11 @@ export interface HydroDebug {
 
 export interface HydroResult {
   stamps: Map<VertexKey, HydroStamp>;
+  /**
+   * Drainage-network edges for fine-layer trunk seeding (see field.ts).
+   * Empty when the field has no fine detail — always safe to pass through.
+   */
+  trunks: TrunkSeg[];
   stats: HydroStats;
   debug?: HydroDebug;
 }
@@ -62,6 +68,7 @@ const SWAMP_MIN = 0.012; // fill depth above which it is a wetland
 const LOSS = 0.004; // per-edge transmission loss (evaporation / infiltration)
 const EPS = 3e-4; // flat-area gradient injected by the fill
 const RIVER_QUANTILE = 0.08; // fraction of land vertices that are channels
+const TRUNK_FLOOR = 0.02; // minimum channel strength worth seeding at fine LODs
 
 /** Binary min-heap on float priorities with int payloads. */
 class MinHeap {
@@ -332,13 +339,40 @@ export function computeHydro(
     rivers,
     lakes,
     swamps,
+    trunks: 0,
     ms: performance.now() - t0,
     thr,
     vertices: N,
   };
 
+  // ---- 6. trunk segments for fine-layer seeding (phase 3) ----
+  // One segment per channel vertex, source -> receiver. Refined vertices
+  // re-stamp these as a distance field (width ∝ strength) so channels stay
+  // crisp and meander at fine LODs instead of smearing by interpolation.
+  const trunks: TrunkSeg[] = [];
+  for (let k = 0; k < N; k++) {
+    if (isOcean[k]) continue;
+    const st = stamps.get(keyOf[k]);
+    if (!st || st.river <= TRUNK_FLOOR) continue;
+    const r = recv[k];
+    if (r < 0) continue;
+    const si = k % W1;
+    const sj = (k / W1) | 0;
+    const ri = r % W1;
+    const rj = (r / W1) | 0;
+    trunks.push({
+      a1: si * FIX,
+      b1: sj * FIX,
+      a2: ri * FIX,
+      b2: rj * FIX,
+      q: st.river,
+    });
+  }
+  stats.trunks = trunks.length;
+
   return {
     stamps,
+    trunks,
     stats,
     debug: withDebug ? { recv, acc, filled, rain, isOcean } : undefined,
   };

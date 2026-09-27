@@ -56,6 +56,7 @@ export interface Stats {
   rivers: number;
   lakes: number;
   swamps: number;
+  trunks: number;
   hydroMs: number;
   mapW: number;
   mapH: number;
@@ -68,6 +69,7 @@ export interface HoverCorner {
   z: number;
   river: number;
   lake: number;
+  fill: number;
   dominant: number;
 }
 
@@ -139,6 +141,8 @@ export class IsoTriEngine {
   showVertices = false;
   showRivers = true;
   thrMult = 1.0;
+  /** View preference: fine-layer hydrology detail on refined tiles. */
+  private fineDetailPref = true;
 
   private zoom = 20;
   private panX = 0;
@@ -263,6 +267,7 @@ export class IsoTriEngine {
       for (let i = 0; i < this.geo.w; i++) this.mesh.addRootCell(i, j);
     this.field = new VertexField(this.seed, this.geo);
     this.field.materializeRoots(this.geo.w, this.geo.h);
+    this.field.setFineHydro(this.fineDetailPref);
     this.undoStack = [];
     this.redoStack = [];
     this.runHydro();
@@ -292,7 +297,7 @@ export class IsoTriEngine {
   /** Full recompute on the root lattice + stamp into the field. */
   private runHydro(): void {
     const res = computeHydro(this.field, this.seed, { thrMult: this.thrMult });
-    this.field.setHydro(res.stamps);
+    this.field.setHydro(res.stamps, res.trunks);
     this.lastHydro = res.stats;
     this.dirty = true;
   }
@@ -313,6 +318,21 @@ export class IsoTriEngine {
     this.runHydro();
     this.emitStats();
     this.scheduleSave();
+  }
+
+  /**
+   * Fine-layer hydrology detail (trunk seeding + lake-level clamping on
+   * refined tiles). A derivation toggle: coarse views never change.
+   */
+  get fineDetail(): boolean {
+    return this.field.fineHydro;
+  }
+
+  set fineDetail(on: boolean) {
+    this.fineDetailPref = on;
+    this.field.setFineHydro(on);
+    this.dirty = true;
+    this.emitStats();
   }
 
   // ---------------- persistence ----------------
@@ -413,6 +433,7 @@ export class IsoTriEngine {
       for (let i = 0; i < this.geo.w; i++) this.mesh.addRootCell(i, j);
     this.field = new VertexField(this.seed, this.geo);
     this.field.materializeRoots(this.geo.w, this.geo.h);
+    this.field.setFineHydro(this.fineDetailPref);
     for (const [key, o] of doc.ov) this.field.overrides.set(key, o);
     for (const k of doc.subdiv) {
       const t = this.mesh.get(k);
@@ -694,6 +715,7 @@ export class IsoTriEngine {
       rivers: this.lastHydro?.rivers ?? 0,
       lakes: this.lastHydro?.lakes ?? 0,
       swamps: this.lastHydro?.swamps ?? 0,
+      trunks: this.lastHydro?.trunks ?? 0,
       hydroMs: this.lastHydro?.ms ?? 0,
       mapW: this.geo.w,
       mapH: this.geo.h,
@@ -931,6 +953,7 @@ export class IsoTriEngine {
           z: v.z,
           river: v.river,
           lake: v.lake,
+          fill: v.fill,
           dominant: this.field.dominant(v.w),
         };
       });

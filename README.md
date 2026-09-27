@@ -24,6 +24,8 @@ Any triangle can be **refined into four deterministic children** (with the other
 
 **Hydrology from terrain.** A priority-flood depression filling (Barnes-style min-heap from the ocean) flattens sinks; receivers are the steepest filled-descent (discovery-parent fallback on flats); discharge accumulates in a single topological pass, `acc(u) = rain(u) + Σ acc(child)·loss`, in `O(V log V)`. Discharge above a threshold becomes a river with width ∝ √Q; deep fills become lakes, shallow fills become wetlands that boost riparian moisture. Because stamps are *derived*, editing elevation re-routes rivers automatically.
 
+**Fine-layer inheritance.** The coarse solve also emits its drainage network as trunk segments (source → receiver, with channel strength). Refined vertices re-stamp those trunks as a smooth distance field with a deterministic low-frequency meander — so rivers stay crisp at width ∝ √Q and gain fine-scale bends as you subdivide or zoom, instead of smearing into the interpolation. Lake surfaces clamp flat to the inherited water level at every LOD (shorelines stop soaking half the relief noise), and each vertex carries its water level (`fill`) as a first-class channel. Coarse views are byte-exact either way — the whole layer is a pure derivation with a display toggle.
+
 **Authoritative state is tiny.** The whole document is `{world size, seed, sparse vertex overrides, subdivision structure}` — everything else (weights, hydrology, mesh, rendering) is a deterministic derivation. That is what makes save/load trivial and undo/redo exact, and it is why the map size is just another input: terrain is a pure function of `(seed, geometry)`.
 
 ## Quickstart
@@ -52,7 +54,7 @@ npm test           # core property-test suite (uses bun; or: npx tsx scripts/tes
 | **Merge** | Coalesce a refined patch back to its parent tile |
 | **Pan** | Drag to pan, wheel / pinch to zoom |
 
-Extras: **map size presets** — Small 22×16 · Medium 30×22 · Large 44×32 · Huge 64×46 root cells (resizing regenerates the world at the same seed, with a two-click confirm; older saved worlds load at their original size); seed input + dice button regenerates the world; hydrology panel toggles rivers and tunes the discharge threshold; undo/redo; hover inspector shows per-corner values; the document auto-saves to `localStorage` and restores on reload; two-click Reset returns to the pristine seed world.
+Extras: **map size presets** — Small 22×16 · Medium 30×22 · Large 44×32 · Huge 64×46 root cells (resizing regenerates the world at the same seed, with a two-click confirm; older saved worlds load at their original size); seed input + dice button regenerates the world; hydrology panel toggles rivers and **fine detail** (trunk seeding + lake-level clamping on refined tiles) and tunes the discharge threshold; undo/redo; hover inspector shows per-corner values including the water level; the document auto-saves to `localStorage` and restores on reload; two-click Reset returns to the pristine seed world.
 
 Because the island radius scales with the world, landmass composition stays constant across sizes — Huge is genuinely more continent, not a stretched island. The hydrology solve is `O(V log V)`: even the Huge world (3,055 root vertices, 67 rivers) solves in single-digit milliseconds, so live re-routing stays instant at every size.
 
@@ -112,9 +114,9 @@ scripts/
 
 ## Status & roadmap
 
-Implemented: vertex-weight tile factory · deterministic hierarchy with balanced subdivision · continental hydrology with live re-routing · selectable world size (documented in the save format, back-compatible) · elevation + weight painting · undo/redo · save/load · hover inspection.
+Implemented: vertex-weight tile factory · deterministic hierarchy with balanced subdivision · continental hydrology with live re-routing · **fine-layer hydrology inheritance (trunk seeding + lake-level clamping)** · selectable world size (documented in the save format, back-compatible) · elevation + weight painting · undo/redo · save/load · hover inspection.
 
-Next phases (per the design notes): fine-layer hydrology inheritance (trunk seeding, lake-level clamping), road networks (A* over the weight field, stamped back as overlays), minimap from the coarse LOD, per-edge sharpness flags for walls/canals, WASM port of the core.
+Next phases (per the design notes): road networks (A* over the weight field, stamped back as overlays), minimap from the coarse LOD, per-edge sharpness flags for walls/canals, WASM port of the core.
 
 ## Notes
 

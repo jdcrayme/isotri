@@ -106,6 +106,7 @@ export default function IsoTriEditor() {
   const [wireframe, setWireframe] = useState(false);
   const [dots, setDots] = useState(false);
   const [riversOn, setRiversOn] = useState(true);
+  const [fineDetail, setFineDetail] = useState(true);
   const [thrMult, setThrMult] = useState(1);
   const [seedText, setSeedText] = useState("7");
   const [stats, setStats] = useState<Stats>({
@@ -115,6 +116,7 @@ export default function IsoTriEditor() {
     rivers: 0,
     lakes: 0,
     swamps: 0,
+    trunks: 0,
     hydroMs: 0,
     mapW: 30,
     mapH: 22,
@@ -182,6 +184,9 @@ export default function IsoTriEditor() {
   useEffect(() => {
     engineRef.current?.setThrMult(thrMult);
   }, [thrMult]);
+  useEffect(() => {
+    if (engineRef.current) engineRef.current.fineDetail = fineDetail;
+  }, [fineDetail]);
 
   const regenerate = (seed: number) => {
     const s = Number.isFinite(seed) ? Math.floor(seed) : 1;
@@ -445,6 +450,17 @@ export default function IsoTriEditor() {
               </Label>
               <Switch id="riv" checked={riversOn} onCheckedChange={setRiversOn} />
             </div>
+            <div className="flex items-center justify-between gap-3">
+              <Label htmlFor="fd" className="text-xs text-zinc-300">
+                Fine detail
+              </Label>
+              <Switch id="fd" checked={fineDetail} onCheckedChange={setFineDetail} />
+            </div>
+            <p className="text-[10px] leading-snug text-zinc-500">
+              seeds {stats.trunks.toLocaleString()} trunk segments into refined
+              tiles — rivers stay crisp and meander when you subdivide or zoom;
+              lake surfaces clamp flat to their water level.
+            </p>
             <div>
               <div className="mb-1 flex items-center justify-between">
                 <Label htmlFor="thr" className="text-xs text-zinc-300">
@@ -507,8 +523,10 @@ export default function IsoTriEditor() {
               as flat water), and discharge above a threshold carves rivers that
               widen with flow. Everything is derived — sculpt the terrain and
               the water re-routes. Refining tiles re-derives children as parent
-              interpolation + deterministic noise, so the same seed always gives
-              the same map. Your session auto-saves locally.
+              interpolation + deterministic noise, and the coarse drainage
+              network is re-seeded onto refined tiles so rivers stay crisp and
+              pick up meander detail as you zoom. Your session auto-saves
+              locally.
             </p>
           </section>
         </aside>
@@ -584,7 +602,7 @@ export default function IsoTriEditor() {
                       `z ${c.z.toFixed(2)}`,
                     ];
                     if (c.river > 0.02) extras.push(`riv ${fmtPct(c.river)}`);
-                    if (c.lake > 0.02) extras.push(`lake ${fmtPct(c.lake)}`);
+                    if (c.lake > 0.02) extras.push(`lake ${fmtPct(c.lake)} · lvl ${c.fill.toFixed(2)}`);
                     return (
                       <div key={i} className="flex items-center gap-1.5">
                         <span

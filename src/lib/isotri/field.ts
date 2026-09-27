@@ -21,13 +21,26 @@
  *            palette entry: rivers stay crisp because it inherits by pure
  *            interpolation with no noise)
  *   lake   — 0..1 standing-water strength (lakes / wetlands)
+ *   fill   — local water level (the spill elevation). Carried at roots from
+ *            hydrology stamps, inherited at finer layers with NO noise, so
+ *            refined water surfaces can be clamped flat to it (lake-level
+ *            clamping).
+ *
+ * Fine-layer hydrology inheritance (phase 3):
+ *   The coarse solve also emits its drainage network as TRUNK SEGMENTS
+ *   (root vertex -> receiver, with channel strength). Refined vertices
+ *   re-stamp the trunk locally: river = max(interpolated, distance-field
+ *   of nearby segments with a smooth deterministic meander wobble). This
+ *   keeps channels crisp at width ∝ √Q instead of smearing with
+ *   interpolation, and adds band-limited meander detail that only exists
+ *   at fine LODs (coarse views are untouched — refine-invariance holds).
  *
  * User overrides are PARTIAL: painting weights keeps seed elevation fluid,
  * painting elevation re-derives weights from classify(). Hydrology stamps are
  * a separate derived layer — recomputed wholesale, never painted.
  */
 
-import { clamp, fbm, hashNoise, smoothstep, hash3 } from "./hash";
+import { clamp, fbm, hash3, hashNoise, smoothstep, valueNoise } from "./hash";
 import {
   FIX,
   SQRT3_2,
@@ -56,6 +69,21 @@ export interface VV {
   w: Float32Array; // length K, sums to ~1
   river: number;
   lake: number;
+  fill: number; // local water level (spill elevation near water)
+}
+
+/**
+ * One drainage-network edge on the root lattice, emitted by the hydrology
+ * core for fine-layer trunk seeding. Coordinates are FIXED-POINT lattice
+ * coords of the two root endpoints; `q` is the channel strength (0..1) at
+ * the source — the fine distance field reproduces width ∝ √Q from it.
+ */
+export interface TrunkSeg {
+  a1: number;
+  b1: number;
+  a2: number;
+  b2: number;
+  q: number;
 }
 
 /** Partial user override — only the fields the user actually touched. */
@@ -224,6 +252,39 @@ function ampWeight(L: number): number {
   return 0.3 * Math.pow(0.55, L - 1);
 }
 
+// ---- fine-layer trunk seeding constants ----
+
+/** Peak amplitude (world units) of the deterministic meander wobble. */
+const TRUNK_MEANDER = 0.36;
+
+/**
+ * Channel half-width (world units) for a trunk of strength q — matched to
+ * the coarse view, where a vertex with stamp q falls to the shader's
+ * channel-core threshold (~0.22·q) about 0.75–0.8 cells from the center.
+ */
+function trunkHalfWidth(q: number): number {
+  return 0.55 + 0.45 * q;
+}
+
+/** Squared-distance-free point/segment distance in world units. */
+function distToSegment(
+  px: number,
+  py: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number
+): number {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  let t = 0;
+  if (len2 > 1e-12) t = clamp(((px - ax) * dx + (py - ay) * dy) / len2, 0, 1);
+  const ex = px - (ax + t * dx);
+  const ey = py - (ay + t * dy);
+  return Math.sqrt(ex * ex + ey * ey);
+}
+
 export class VertexField {
   seed: number;
   /** World geometry (size/center/island radius) — part of the document. */
@@ -235,6 +296,14 @@ export class VertexField {
    * recompute; never painted. Not serialized (pure function of terrain).
    */
   hydro = new Map<VertexKey, HydroStamp>();
+  /**
+   * Fine-layer hydrology detail: trunk seeding + lake-level clamping on
+   * refined tiles. Purely a derivation toggle — coarse (level-0) values are
+   * identical either way.
+   */
+  fineHydro = true;
+  /** Spatial hash of drainage trunk segments (cell -> segments). */
+  private trunkGrid = new Map<number, TrunkSeg[]>();
   /** Derived-value cache (invalidated wholesale on any edit — cheap). */
   private cache = new Map<VertexKey, VV>();
   /** Vertices that exist (level-0 grid + every created midpoint). */
@@ -278,6 +347,7 @@ export class VertexField {
     let z: number;
     let lake: number;
     let river: number;
+    let fill: number;
     let w: Float32Array | null = null;
 
     if (L === 0) {
@@ -287,6 +357,7 @@ export class VertexField {
       z = elev;
       lake = 0;
       river = 0;
+      fill = elev;
     } else {
       const parents = vertexParents(a, b)!;
       const p1 = this.value(parents[0]);
@@ -300,8 +371,24 @@ export class VertexField {
       );
       lake = (p1.lake + p2.lake) * 0.5;
       river = (p1.river + p2.river) * 0.5; // rivers stay crisp: no noise
+      fill = (p1.fill + p2.fill) * 0.5; // water level inherits smoothly
       // land gets the relief noise; lakes stay flat at their surface level
       z = (p1.z + p2.z) * 0.5 + ne * (1 - clamp(lake, 0, 1));
+
+      // ---- fine-layer trunk seeding (phase 3) ----
+      // The coarse drainage network is re-stamped onto refined vertices as a
+      // smooth 2D distance field with a deterministic low-frequency meander,
+      // so channels stay crisp at width ∝ √Q and gain fine-scale bends
+      // instead of diluting into the interpolation. Skipped over open water
+      // (rivers never draw across lakes — same rule as the coarse stamps).
+      if (this.fineHydro && this.trunkGrid.size > 0 && lake < 0.5) {
+        const [wx, wy] = worldXY(a, b);
+        const sx = wx + (valueNoise(wx * 1.9 + 41.3, wy * 1.9 + 17.9, this.seed ^ 0x51ab) - 0.5) * TRUNK_MEANDER;
+        const sy = wy + (valueNoise(wx * 1.7 + 91.2, wy * 1.7 + 33.7, this.seed ^ 0x9e21) - 0.5) * TRUNK_MEANDER;
+        const s = this.trunkRiverAt(sx, sy);
+        if (s > river) river = s;
+      }
+
       const aw = ampWeight(L);
       w = new Float32Array(K);
       for (let i = 0; i < K; i++) {
@@ -323,6 +410,7 @@ export class VertexField {
       if (hs.river > river) river = hs.river;
       if (hs.lake > lake) lake = hs.lake;
       if (hs.boost > 0) moist = clamp(moist + hs.boost, 0, 1);
+      fill = hs.fill;
     }
 
     // ---- finalize weights ----
@@ -338,7 +426,13 @@ export class VertexField {
     const lakeS = smoothstep(0.2, 0.62, lake);
     let zFinal = z;
     if (hs && lakeS > 0) {
+      // roots: flatten to the stamped spill level
       zFinal = elev + (hs.fill - elev) * lakeS;
+    } else if (L > 0 && lakeS > 0) {
+      // refined vertices: lake-level clamping — the water surface is pulled
+      // to the inherited water level so lakes render flat at every LOD and
+      // shorelines stay crisp instead of soaking half the relief noise.
+      zFinal = z + (fill - z) * lakeS;
     }
 
     let out: Float32Array;
@@ -353,7 +447,7 @@ export class VertexField {
       out = wf;
     }
 
-    return { elev, z: zFinal, moist, w: out, river, lake };
+    return { elev, z: zFinal, moist, w: out, river, lake, fill };
   }
 
   /** All roots exist regardless of materialization (needed by inheritance). */
@@ -362,9 +456,80 @@ export class VertexField {
   }
 
   /** Replace the hydrology layer wholesale and invalidate derivations. */
-  setHydro(stamps: Map<VertexKey, HydroStamp>): void {
+  setHydro(stamps: Map<VertexKey, HydroStamp>, trunks: TrunkSeg[] = []): void {
     this.hydro = stamps;
+    this.rebuildTrunkIndex(trunks);
     this.clearCache();
+  }
+
+  /** Toggle fine-layer detail (trunk seeding + lake clamping). */
+  setFineHydro(on: boolean): void {
+    if (this.fineHydro === on) return;
+    this.fineHydro = on;
+    this.clearCache();
+  }
+
+  // ---------------- fine-layer trunk index ----------------
+
+  /** Spatial-hash cell size (world units) for the trunk index. */
+  private static readonly TRUNK_CELL = 1.25;
+
+  private static trunkCellKey(cx: number, cy: number): number {
+    // world coords are small (|c| < 200); offset-encode two int16 halves
+    return ((cx + 2048) << 12) | (cy + 2048);
+  }
+
+  private rebuildTrunkIndex(trunks: TrunkSeg[]): void {
+    this.trunkGrid.clear();
+    const C = VertexField.TRUNK_CELL;
+    for (const t of trunks) {
+      const [ax, ay] = worldXY(t.a1, t.b1);
+      const [bx, by] = worldXY(t.a2, t.b2);
+      const hw = trunkHalfWidth(t.q);
+      const pad = hw + TRUNK_MEANDER + 0.05;
+      const x0 = Math.floor((Math.min(ax, bx) - pad) / C);
+      const x1 = Math.floor((Math.max(ax, bx) + pad) / C);
+      const y0 = Math.floor((Math.min(ay, by) - pad) / C);
+      const y1 = Math.floor((Math.max(ay, by) + pad) / C);
+      for (let cx = x0; cx <= x1; cx++) {
+        for (let cy = y0; cy <= y1; cy++) {
+          const k = VertexField.trunkCellKey(cx, cy);
+          const bucket = this.trunkGrid.get(k);
+          if (bucket) bucket.push(t);
+          else this.trunkGrid.set(k, [t]);
+        }
+      }
+    }
+  }
+
+  /**
+   * Distance-field stamp of the drainage network at a (wobbled) world
+   * point: the strongest channel contribution from nearby trunk segments.
+   */
+  private trunkRiverAt(sx: number, sy: number): number {
+    const C = VertexField.TRUNK_CELL;
+    const cx = Math.floor(sx / C);
+    const cy = Math.floor(sy / C);
+    let best = 0;
+    for (let ix = cx - 1; ix <= cx + 1; ix++) {
+      for (let iy = cy - 1; iy <= cy + 1; iy++) {
+        const bucket = this.trunkGrid.get(VertexField.trunkCellKey(ix, iy));
+        if (!bucket) continue;
+        for (let n = 0; n < bucket.length; n++) {
+          const t = bucket[n];
+          const [ax, ay] = worldXY(t.a1, t.b1);
+          const [bx, by] = worldXY(t.a2, t.b2);
+          const d = distToSegment(sx, sy, ax, ay, bx, by);
+          const hw = trunkHalfWidth(t.q);
+          if (d >= hw) continue;
+          // flat core out to 0.3·hw (so the centerline keeps the coarse
+          // strength exactly), then a smooth bank falloff to the edge
+          const s = t.q * (1 - smoothstep(hw * 0.3, hw, d));
+          if (s > best) best = s;
+        }
+      }
+    }
+    return best;
   }
 
   isRoot(key: VertexKey): boolean {
